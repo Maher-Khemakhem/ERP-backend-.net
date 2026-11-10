@@ -1,202 +1,204 @@
-# Java to .NET Backend Migration Guide
+[Frontend repository](https://github.com/Maher-Khemakhem/ERP_frontend)
 
-This guide describes the Java-to-.NET backend migration. The ASP.NET Core API in `backend-.net/SupermarketErp.Api` now covers the documented authentication, inventory, pricing, POS, procurement, finance, storefront, and Stripe test-checkout route families. It has not yet completed contract-level parity review or production cutover work.
+# Supermarket ERP .NET API
 
-## Run the .NET API
+This directory contains the ASP.NET Core backend for Supermarket ERP. It is a .NET 10 Minimal API organized by feature folders and backed by SQL Server.
 
-Install the **.NET 10 SDK** for Windows from the [official .NET download page](https://dotnet.microsoft.com/en-us/download/dotnet/10.0). The SDK is required to build and run the API. After installation, open a new PowerShell window and check `dotnet --version`.
+## Requirements
 
-Copy `backend-.net/SupermarketErp.Api/.env.example` to `backend-.net/SupermarketErp.Api/.env`, then edit the database password and local signing key. The API reads that `.env` file on startup; process-level environment variables take precedence. The file is ignored by Git.
+- .NET 10 SDK
+- Docker Desktop (for the local SQL Server container)
+- SQL Server 2022 or a compatible SQL Server instance
 
-For local SQL Server, start the container from the repository root:
+## Local setup
+
+From the repository root, start SQL Server:
 
 ```powershell
 $env:MSSQL_SA_PASSWORD = "Use-a-local-development-password-123!"
 docker compose -f docker-compose.sqlserver.yml up -d
 ```
 
-The password must satisfy SQL Server complexity requirements. Do not commit it or use it in a shared deployment.
+The password must satisfy SQL Server complexity requirements. Do not commit it or use it in a shared environment.
 
-From the repository root, start the API:
+Create the local environment file:
 
 ```powershell
 Copy-Item backend-.net/SupermarketErp.Api/.env.example backend-.net/SupermarketErp.Api/.env
-# Edit the .env file before starting the API.
+```
+
+Edit `backend-.net/SupermarketErp.Api/.env` and set at least:
+
+```text
+JWT_SECRET=at-least-32-random-characters
+DB_HOST=localhost
+DB_PORT=1433
+DB_NAME=supermarket_erp_saas_dev
+DB_USERNAME=sa
+DB_PASSWORD=the-same-password-used-for-the-container
+```
+
+The `.env` file is ignored by Git. Process environment variables take precedence over values loaded from this file. A complete template, including optional Stripe settings, is available in [`SupermarketErp.Api/.env.example`](SupermarketErp.Api/.env.example).
+
+Run the API from the repository root:
+
+```powershell
 dotnet run --project backend-.net/SupermarketErp.Api
 ```
 
-The API listens on port `8080` and connects to SQL Server using `Microsoft.Data.SqlClient`. The .NET-owned identity and outbox tables are created at startup. Business tables must be provisioned in the SQL Server database before use; the Java Flyway migrations are PostgreSQL-specific and must not be applied directly to SQL Server. OpenAPI is available at `/openapi/v1.json` in Development, and readiness is available at `/health/ready`.
+The API listens on `http://localhost:8080`. OpenAPI is available at [`/openapi/v1.json`](http://localhost:8080/openapi/v1.json) in Development. Health endpoints are:
 
-## Build a .NET container
+- [`/health/live`](http://localhost:8080/health/live) — confirms that the process is running.
+- [`/health/ready`](http://localhost:8080/health/ready) — confirms that SQL Server is reachable.
 
-The existing `Dockerfile.backend` still packages the Java service. Build the .NET image separately while migration and parity work is in progress:
+At startup, the API creates its identity tables and the `platform.dotnet_outbox` table if they do not already exist. Business tables must be present in the configured SQL Server database.
+
+## Architecture
+
+The backend is a modular monolith. It runs as one ASP.NET Core process, while feature folders keep authentication, business workflows, and persistence responsibilities separated.
+
+```mermaid
+flowchart TD
+    Frontend[ERP frontend] -->|HTTP / JSON| Api[ASP.NET Core Minimal API<br/>Port 8080]
+    Api --> Auth[Authentication and authorization]
+    Api --> Features[Feature endpoints and services]
+    Features --> Repositories[Feature repositories]
+    Repositories --> SqlServer[(SQL Server)]
+    Features --> Outbox[(Transactional outbox)]
+    Outbox --> Processor[Outbox processor]
+    Processor --> Consumers[Finance and alert consumers]
+    Api --> Expiry[Online-order expiry worker]
+    Expiry --> SqlServer
+    Api --> Stripe[Stripe test checkout]
+```
+
+### Application layers
+
+- **API layer** — Minimal API endpoint groups under `Features/*` map HTTP requests, apply authorization policies, validate input, and return JSON responses.
+- **Application and domain layer** — Feature services coordinate use cases and enforce business rules for inventory, pricing, POS, procurement, finance, and ecommerce.
+- **Infrastructure layer** — `Infrastructure/` provides SQL Server access, environment-file loading, JWT-related startup configuration, exception handling, and background processing.
+- **Persistence layer** — Feature repositories use `Microsoft.Data.SqlClient` to read and write SQL Server. Cross-feature identifiers are passed explicitly rather than through shared entity relationships.
+
+### Feature boundaries
+
+The main feature areas are:
+
+- **Auth** — setup, users, BCrypt password verification, JWTs, roles, and login rate limiting.
+- **Inventory** — products, product families, stock, receiving, and product images.
+- **Pricing** — product prices and promotions.
+- **POS** — tills, cash sessions, sales, payments, voids, and scanner pairing.
+- **Procurement** — suppliers, purchase orders, receiving, and low-stock alerts.
+- **Finance** — journals, ledger entries, supplier invoices, payments, and settlements.
+- **Ecommerce** — storefront catalog, carts, online orders, reservations, and Stripe test checkout.
+
+Feature code should use another feature's public service or an outbox event instead of accessing its repository directly.
+
+### Authentication and request flow
+
+Most routes require a JWT bearer token. The API validates the token issuer, audience, signature, and lifetime, then maps the `roles` claim to the configured authorization policies. Public routes are limited to setup status, registration/login, health checks, development OpenAPI, storefront access where configured, and scanner endpoints authenticated by their pairing token.
+
+For a normal authenticated request:
+
+1. The frontend sends JSON and a bearer token to an `/api` route.
+2. ASP.NET Core authenticates the token and applies the endpoint's role policy.
+3. The feature endpoint calls its application service or repository.
+4. The operation reads or updates SQL Server inside the required transaction.
+5. Any cross-feature event is stored in the transactional outbox before the request completes.
+
+### Background processing
+
+The outbox processor retries pending events and supports idempotent event handling. The online-order expiry worker periodically finds unpaid expired orders and releases their reservations. Both workers run inside the API host and use the same SQL Server database as the request pipeline.
+
+## Configuration
+
+The API accepts either a complete `DB_CONNECTION_STRING` or these database settings:
+
+| Variable | Required | Description |
+|---|---:|---|
+| `JWT_SECRET` | Yes | JWT signing secret containing at least 32 bytes |
+| `JWT_ISSUER` | No | JWT issuer; defaults to `supermarket-erp` |
+| `JWT_AUDIENCE` | No | JWT audience; defaults to `supermarket-web` |
+| `DB_CONNECTION_STRING` | No | Complete SQL Server connection string |
+| `DB_HOST` | No | SQL Server host; defaults to `localhost` |
+| `DB_PORT` | No | SQL Server port; defaults to `1433` |
+| `DB_NAME` | No | Database name; defaults to `supermarket_erp_saas_dev` |
+| `DB_USERNAME` | No | Database user; defaults to `sa` |
+| `DB_PASSWORD` | No | Database password |
+| `APP_UPLOAD_DIR` | No | Product image directory; defaults to `uploads/products` |
+| `STRIPE_SECRET_KEY` | No | Stripe test-mode secret key |
+| `STRIPE_WEBHOOK_SECRET` | No | Stripe webhook signing secret |
+| `STRIPE_TND_TO_EUR_RATE` | No | TND-to-EUR conversion rate for test checkout |
+| `STRIPE_STOREFRONT_RETURN_BASE_URL` | No | Storefront URL used after Stripe checkout |
+
+`JWT_SECRET` is validated when the application starts. Stripe settings are only needed for Stripe test checkout.
+
+## API areas
+
+All protected business routes use the `/api` prefix and require a bearer JWT unless noted otherwise.
+
+- `/api/auth` — setup, login, customer login, and user administration.
+- `/api/inventory` — products, product families, stock, receiving, and product images.
+- `/api/pricing` — product prices and promotions.
+- `/api/pos` — tills, cash sessions, transactions, payments, voids, and scanner pairing.
+- `/api/procurement` — suppliers, purchase orders, receiving, and low-stock alerts.
+- `/api/finance` — ledger, journals, supplier invoices, payments, and card settlements.
+- `/api/store` — customer catalog, cart, and online checkout.
+- `/api/online-orders` — staff management of online orders.
+- `/api/store/stripe` — Stripe test checkout and webhook handling.
+
+The first registration creates an administrator when no users exist. Subsequent user administration requires the `ADMIN` role. Other roles are `MANAGER`, `CASHIER`, `INVENTORY_MANAGER`, `ACCOUNTANT`, and `CUSTOMER`.
+
+## Runtime behavior
+
+- Authentication uses BCrypt password verification and JWT bearer tokens.
+- SQL Server access uses `Microsoft.Data.SqlClient`.
+- Domain events are written to the SQL Server transactional outbox and processed by a hosted worker.
+- Online orders have a hosted expiry worker that releases reservations for unpaid orders.
+- Product images are stored outside the database. Set `APP_UPLOAD_DIR` to a persistent directory in deployed environments.
+- Stripe integration is test-mode only and validates webhook signatures.
+- Development CORS permits local HTTP/HTTPS origins. Configure the reverse proxy and allowed origins appropriately for production.
+
+## Build
+
+Build the API:
 
 ```powershell
-docker build -f Dockerfile.backend-dotnet -t supermarket-erp-api-dotnet .
+dotnet build backend-.net/SupermarketErp.Api/SupermarketErp.Api.csproj
 ```
 
-Pass the same SQL Server and JWT environment variables shown above when running the image. Mount a persistent directory at `/data/uploads/products` so uploaded product images survive container replacement. This image does not run database migrations. Keep production traffic on the current deployment until the .NET service has passed contract, database snapshot, and staging checks.
+## Container image
 
-The .NET implementation includes those route groups plus `/api/store/*`, `/api/online-orders/*`, and `/api/store/stripe/*`. It adds a PostgreSQL outbox for sales, cash-session closes, low-stock alerts, and goods receipts, plus a worker that expires unpaid online orders and releases reservations. Stripe checkout remains test-mode only. Runtime/database behavior still needs review against a migrated PostgreSQL snapshot and the Java OpenAPI contract.
+Build the .NET image from the repository root:
 
-## Current system
-
-- `ERP/` is a Java 21, Spring Boot modular monolith exposing the REST API on port `8080` under `/api`.
-- The API serves both `supermarket-erp/` (staff) and `supermarket-storefront/` (customers). The phone scanner also uses the API.
-- The Java backend uses PostgreSQL and Flyway. The .NET backend uses SQL Server and `Microsoft.Data.SqlClient`; its SQL schema requires a separate SQL Server migration set.
-- Business areas include `auth`, `inventory`, `pricing`, `pos`, `procurement`, `finance`, `ecommerce`, and `shared`.
-- POS, online checkout, inventory, and procurement coordinate transactional operations. Finance and procurement also consume domain events.
-- The current backend API and implementation details are documented in [ERP/README.md](../ERP/README.md). Read that endpoint map and the migration scripts before porting a feature.
-
-## Recommended architecture
-
-Keep a **modular monolith** in ASP.NET Core, matching the current system's overall shape. Run one backend application and use one SQL Server database, while keeping business areas such as inventory, POS, and finance behind clear module boundaries. A direct framework replacement should preserve those boundaries and externally visible behavior before introducing new architecture.
-
-Within each module, use a simple layered structure:
-
-```text
-HTTP/API -> application services -> domain model
-                 |                     |
-                 +---- interfaces ------+
-                           |
-                    infrastructure (EF Core, PostgreSQL, external services)
+```powershell
+docker build -f Dockerfile.backend-dotnet -t supermarket-erp-api .
 ```
 
-Controllers handle HTTP concerns. Application services coordinate a use case and its transaction. Domain objects enforce business rules and state transitions. Infrastructure implements persistence and external integrations. Keep interfaces at module boundaries so, for example, POS calls the inventory module's public stock service instead of its repositories.
+The image listens on port `8080` and stores product uploads under `/data/uploads/products`. Mount a persistent volume at that path and provide the database and JWT settings as environment variables when running the container.
 
-### Where CQRS fits
-
-CQRS means separating the model used to change state (commands) from the model used to read state (queries). It is a design pattern that can be used inside a modular monolith; it does not mean the application must use microservices, separate databases, or an event stream.
-
-For this migration, **do not adopt full CQRS as a prerequisite**. Keep ordinary reads and writes straightforward, and keep each business mutation in an application service with the database transaction it needs. Add a separate query model only where it solves a real problem, such as complex finance reports or a dashboard assembled from several modules. The existing domain events and replacement outbox are for reliable cross-module reactions; they do not by themselves mean the whole application follows CQRS.
-
-This choice keeps critical operations such as completing a sale, reserving stock, and receiving a purchase order synchronous and atomic in SQL Server. It also avoids introducing read-model synchronization and eventual consistency across ordinary screens before there is a demonstrated need.
-
-| Current | .NET equivalent to evaluate |
-|---|---|
-| Spring Boot application | ASP.NET Core Web API, using a supported .NET LTS release |
-| Spring MVC controllers | ASP.NET Core controllers or Minimal APIs; use one consistent style |
-| Spring Security resource server | ASP.NET Core authentication/authorization with JWT bearer validation |
-| Spring Data JPA / Hibernate | Explicit SQL with `Microsoft.Data.SqlClient`; EF Core can be introduced after the SQL Server schema is established |
-| Jakarta validation | ASP.NET Core model validation and explicit domain validation |
-| `@Transactional` | EF Core/database transactions around the same business operations |
-| Spring Modulith modules | Separate .NET projects or feature folders with enforced dependency rules |
-| Modulith persisted event publications | A SQL Server transactional outbox and idempotent consumers |
-| Flyway | A separate SQL Server migration set; PostgreSQL Flyway scripts are not portable without conversion |
-| Springdoc OpenAPI | ASP.NET Core OpenAPI generation, preserving the API contract |
-
-These are starting points, not one-to-one substitutions. Keep business rules in domain/application services instead of moving them into controllers or EF entities.
-
-## Compatibility requirements
-
-Treat the current backend as the behavioral specification. Before replacing an endpoint, record its route, HTTP method, request and response JSON, status codes, authorization roles, and side effects. Preserve these contracts so neither React application needs a coordinated rewrite.
-
-- Keep `/api` routes and the development API port `8080` initially. Preserve the frontend's bearer-token flow and Vite proxy behavior.
-- Preserve role names and route access: `ADMIN`, `MANAGER`, `CASHIER`, `INVENTORY_MANAGER`, and `ACCOUNTANT`.
-- Match JSON field names, UUID formats, decimal precision, date/time formats, null handling, error responses, and pagination conventions.
-- Preserve `Money` in TND at three decimal places, and `Quantity` rules (`EACH` versus kilograms with three decimal places).
-- Keep stock allocation FEFO, reservation accounting, optimistic concurrency behavior, and rollback guarantees for sale, checkout, and receipt operations.
-- Preserve event idempotency and journal/payment unique-key behavior. Event delivery is not a reason to post duplicate finance records.
-- Preserve product image uploads, scanner pairing, Stripe test checkout and webhook signature checks, scheduled order expiry, and their configuration.
-- Preserve first-admin setup, BCrypt password verification, JWT signing configuration, token claims, and expiration behavior. Do not reset or silently invalidate user accounts during cutover.
-
-Current caveats and behaviors to verify are called out in [AGENTS.md](../AGENTS.md) and [ERP/README.md](../ERP/README.md). Confirm their current status before treating them as requirements or fixing them as part of the port.
-
-## Database and data migration
-
-The first .NET version should connect to the existing PostgreSQL database and existing schemas. Do not recreate tables from EF models or drop Spring infrastructure tables during the application rewrite.
-
-1. Inventory every migration under `ERP/src/main/resources/db/migration`, including compatibility and data-backfill scripts. Record the applied Flyway version in each target environment.
-2. Map each entity/value object to its existing table, schema, constraints, indexes, enum representation, timestamp convention, and numeric precision.
-3. Keep Flyway as the only schema-change authority during the initial port. The .NET service can use the existing database without using JPA. If moving to EF migrations later, define a deliberate baseline and ownership handoff; do not let Flyway and EF independently mutate the same schema.
-4. Retain all existing records and IDs. Confirm that EF does not accidentally treat logical cross-module UUIDs as new foreign keys or rename schemas/tables based on conventions.
-5. Identify Spring Modulith publication-registry tables separately from business data. Build and operate the replacement outbox before retiring the old event consumers or registry; do not assume the old registry is a compatible .NET queue.
-6. Test upgrade behavior against a copy of a production-like database, including startup with `ddl-auto: validate`-equivalent checks and all supported Flyway histories.
-
-## Suggested solution layout
-
-The implementation starts as one ASP.NET Core project with feature folders. It can be split into module projects later if that improves dependency enforcement without slowing the port:
+## Project layout
 
 ```text
 backend-.net/
   SupermarketErp.Api/
-    Features/Auth/
-    Features/Inventory/             Catalog, product families, stock, receiving
-    Features/Pricing/                Product prices and promotions
-    Features/Procurement/            Suppliers, purchase orders, alerts
-    Features/Pos/                    Tills, sessions, sales, scanner pairing
-    Features/Finance/                Journals, reports, invoices, payments
+    Features/
+      Auth/
+      Ecommerce/
+      Finance/
+      Inventory/
+      Pos/
+      Pricing/
+      Procurement/
     Infrastructure/
+    Program.cs
+    SupermarketErp.Api.csproj
 ```
 
-Keep module dependencies explicit. For example, POS and ecommerce may call the public inventory and pricing application interfaces; finance should react to business events through the outbox rather than being called directly from every workflow. Avoid references to another module's persistence implementation.
+Feature endpoints and application services should remain within their feature area. Shared infrastructure belongs under `Infrastructure/`, and cross-feature workflows should use explicit application services or outbox events rather than reaching into another feature's persistence details.
 
-## Migration sequence
+## Related applications
 
-### 1. Establish the contract
-
-- Export or capture the OpenAPI document from the running Java API and retain it as the baseline.
-- Build an endpoint inventory from [ERP/README.md](../ERP/README.md), controllers, security configuration, and the two frontend API clients.
-- Record important behavior and failure cases for sale completion, online checkout/payment/cancellation, goods receipt, cash-session close, supplier payment, and user setup.
-- Decide which known caveats are intentionally preserved and which are separate product changes.
-
-### 2. Create the .NET foundation
-
-- Add the solution, API host, module projects, PostgreSQL provider, structured logging, configuration binding, health/readiness endpoints, and OpenAPI generation.
-- Read secrets from environment variables or the deployment secret store. Never copy local Java defaults into shared environments.
-- Configure the service to listen on port `8080` and to use the existing `/api` prefix.
-- Add architecture checks that prevent forbidden module-to-module persistence references.
-
-### 3. Port cross-cutting behavior first
-
-- Implement consistent API errors and validation, UTC/date handling, decimal precision, request logging, and database transaction handling.
-- Port JWT validation and authorization policies, preserving claim names and role mappings.
-- Verify BCrypt hashes already stored in PostgreSQL can be checked by the chosen .NET password-hashing implementation. Keep compatibility with existing hashes or plan an explicit, secure rehash-on-login approach.
-- Implement outbox persistence, retry/observability policy, and idempotency keys before moving event-driven finance or alert flows.
-
-### 4. Port modules in dependency order
-
-Suggested order: `shared` and `auth`; `inventory`; `pricing`; `procurement`; `pos`; `finance`; `ecommerce`. Adjust based on dependencies and deployment needs. Port read-only/query paths first when useful, then mutations and their side effects. Keep business transitions and invariants inside domain/application services.
-
-### 5. Compare behavior continuously
-
-- Run the Java and .NET APIs against separate clones of the same sanitized database snapshot.
-- Replay representative requests and compare status codes, JSON, database effects, emitted events, journal entries, stock balances, and reservation balances.
-- Exercise concurrency and failure paths, not only successful requests: insufficient stock, duplicate webhook/event delivery, stale versions, invalid tender, incomplete receipt, and expired orders.
-- Add contract, unit, and PostgreSQL integration tests for each ported behavior. Keep the existing Java test suite passing until Java is retired.
-
-### 6. Deploy and cut over safely
-
-- Update `Dockerfile.backend`, CI/build workflows, local developer setup, installer/runtime packaging, and operational runbooks for the chosen .NET runtime.
-- Keep the same reverse-proxy route, TLS boundary, port, environment-variable semantics where practical, upload volume, and health checks.
-- Use a staging database clone and verify backup/restore before production cutover.
-- Do not send writes to both implementations against the same database. Choose one active writer; use a controlled traffic switch with a rollback plan.
-- Watch API errors, auth failures, database conflicts, outbox backlog, journal totals, stock/reservation balances, Stripe webhook results, and scheduled expiry after cutover.
-- Retire Java deployment artifacts and Spring event infrastructure only after the .NET service is stable and rollback requirements are satisfied.
-
-## Repository work checklist
-
-- [ ] Capture the Java OpenAPI contract and inventory frontend API usage.
-- [x] Choose .NET 10 and pin the project package versions.
-- [x] Add the .NET API project, auth, inventory, pricing, procurement, POS, and finance endpoints.
-- [x] Add a transactional outbox for POS, receipt, cash-close, and low-stock events.
-- [x] Implement the endpoint families documented in `ERP/README.md`.
-- [ ] Enforce module dependency boundaries inside the .NET codebase.
-- [x] Configure the API to use the existing PostgreSQL schemas while Flyway remains the migration owner.
-- [x] Implement authentication, roles, BCrypt password verification, and JWT behavior.
-- [x] Implement inventory/pricing and transactional stock operations.
-- [x] Port POS, procurement, finance, and ecommerce workflows.
-- [x] Implement the transactional outbox, retries, and idempotent event consumers.
-- [x] Port file uploads, scanner pairing, Stripe test checkout, and scheduled expiry.
-- [x] Add a separate .NET Dockerfile and document container startup.
-- [ ] Update CI, installer, and operational scripts after runtime parity is confirmed.
-- [ ] Compare API and database behavior on a sanitized database snapshot.
-- [ ] Complete staging, backup/restore, production cutover, monitoring, and rollback rehearsal.
-- [ ] Remove Java only after all consumers and deployment paths use .NET.
-
-## Related documentation
-
-- [Backend architecture and REST endpoint map](../ERP/README.md)
-- [Repository overview and local setup](../README.md)
-- [Contributor architecture rules](../AGENTS.md)
-- [Operations and backup/restore](../ops/windows/README.md)
+- [`supermarket-erp`](../supermarket-erp/) — staff web application.
+- [`supermarket-storefront`](../supermarket-storefront/) — customer storefront.
+- [`docker-compose.sqlserver.yml`](../docker-compose.sqlserver.yml) — local SQL Server service.
+- [`Dockerfile.backend-dotnet`](../Dockerfile.backend-dotnet) — production container image.
