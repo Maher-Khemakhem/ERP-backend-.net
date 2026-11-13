@@ -1,7 +1,7 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Collections.Concurrent;
-using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
 using SupermarketErp.Api.Features.Auth;
 using SupermarketErp.Api.Infrastructure;
 
@@ -107,508 +107,90 @@ public static class PosEndpoints
     }
 }
 
-public sealed class PosRepository(SqlServerDataSource dataSource)
+public sealed class PosRepository(BusinessDbContext db)
 {
     public async Task<IReadOnlyList<TillView>> ListTills(CancellationToken ct)
     {
-        var list = new List<TillView>();
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("""
-            SELECT t.id,t.till_number,t.status,s.cashier_name,
-                   CASE WHEN s.status='OPEN' THEN s.expected_cash ELSE COALESCE(s.counted_cash,0) END,
-                   s.opened_at,s.closed_at
-            FROM pos.till t LEFT JOIN LATERAL
-                (SELECT * FROM pos.cash_session cs WHERE cs.till_id=t.id ORDER BY cs.opened_at DESC LIMIT 1) s ON 1
-            ORDER BY t.till_number
-            """, connection);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct)) list.Add(ReadTill(reader));
-        return list;
+        var tills = await db.Tills.AsNoTracking().OrderBy(x => x.TillNumber).ToListAsync(ct);
+        var sessions = await db.CashSessions.AsNoTracking().ToListAsync(ct);
+        return tills.Select(t =>
+        {
+            var s = sessions.Where(x => x.TillId == t.Id).OrderByDescending(x => x.OpenedAt).FirstOrDefault();
+            return new TillView(t.Id, t.TillNumber, t.Status, s?.CashierName,
+                FormatMoney(s is { Status: "OPEN" } ? s.ExpectedCash : s?.CountedCash ?? 0m),
+                s is null ? null : JavaInstantFormat.Format(s.OpenedAt),
+                s?.ClosedAt is null ? null : JavaInstantFormat.Format(s.ClosedAt.Value));
+        }).ToList();
     }
 
     public async Task<TillView?> GetTill(Guid id, CancellationToken ct)
     {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("""
-            SELECT t.id,t.till_number,t.status,s.cashier_name,
-                   CASE WHEN s.status='OPEN' THEN s.expected_cash ELSE COALESCE(s.counted_cash,0) END,
-                   s.opened_at,s.closed_at
-            FROM pos.till t LEFT JOIN LATERAL
-                (SELECT * FROM pos.cash_session cs WHERE cs.till_id=t.id ORDER BY cs.opened_at DESC LIMIT 1) s ON 1
-            WHERE t.id=@id
-            """, connection);
-        command.Parameters.AddWithValue("id", id);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? ReadTill(reader) : null;
+        var t = await db.Tills.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct); if (t is null) return null;
+        var s = await db.CashSessions.AsNoTracking().Where(x => x.TillId == id).OrderByDescending(x => x.OpenedAt).FirstOrDefaultAsync(ct);
+        return new TillView(t.Id, t.TillNumber, t.Status, s?.CashierName, FormatMoney(s is { Status: "OPEN" } ? s.ExpectedCash : s?.CountedCash ?? 0m), s is null ? null : JavaInstantFormat.Format(s.OpenedAt), s?.ClosedAt is null ? null : JavaInstantFormat.Format(s.ClosedAt.Value));
     }
 
     public async Task<Guid> CreateTill(CreateTillRequest request, CancellationToken ct)
-    {
-        if (string.IsNullOrWhiteSpace(request.TillNumber)) throw new ArgumentException("Till number is required.");
-        var id = Guid.NewGuid();
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("INSERT INTO pos.till(id,till_number,status,version) VALUES(@id,@number,'CLOSED',0)", connection);
-        command.Parameters.AddWithValue("id", id);
-        command.Parameters.AddWithValue("number", request.TillNumber.Trim());
-        await command.ExecuteNonQueryAsync(ct);
-        return id;
-    }
+    { if (string.IsNullOrWhiteSpace(request.TillNumber)) throw new ArgumentException("Till number is required."); var id=Guid.NewGuid(); db.Tills.Add(new TillEntity { Id=id, TillNumber=request.TillNumber.Trim(), Status="CLOSED" }); await db.SaveChangesAsync(ct); return id; }
 
     public async Task<Guid> OpenSession(OpenSessionRequest request, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(request.CashierName)) throw new ArgumentException("Cashier name is required.");
-        if (request.OpeningFloat < 0) throw new ArgumentException("Opening float cannot be negative.");
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var till = new SqlCommand("SELECT status FROM pos.till WHERE id=@id FOR UPDATE", connection, transaction))
-        {
-            till.Parameters.AddWithValue("id", request.TillId);
-            if (await till.ExecuteScalarAsync(ct) is null) throw new ArgumentException($"Till not found: {request.TillId}");
-        }
-        await using (var check = new SqlCommand("SELECT EXISTS(SELECT 1 FROM pos.cash_session WHERE till_id=@id AND status='OPEN')", connection, transaction))
-        {
-            check.Parameters.AddWithValue("id", request.TillId);
-            if ((bool)(await check.ExecuteScalarAsync(ct) ?? false)) throw new InvalidOperationException("Till already has an open cash session.");
-        }
-        var id = Guid.NewGuid();
-        var now = DateTimeOffset.UtcNow;
-        await using (var insert = new SqlCommand("""
-            INSERT INTO pos.cash_session(id,till_id,cashier_name,opening_float,expected_cash,counted_cash,status,opened_at,closed_at,version)
-            VALUES(@id,@till,@cashier,@float,@float,NULL,'OPEN',@now,NULL,0)
-            """, connection, transaction))
-        {
-            insert.Parameters.AddWithValue("id", id);
-            insert.Parameters.AddWithValue("till", request.TillId);
-            insert.Parameters.AddWithValue("cashier", request.CashierName.Trim());
-            insert.Parameters.AddWithValue("float", request.OpeningFloat);
-            insert.Parameters.AddWithValue("now", now);
-            await insert.ExecuteNonQueryAsync(ct);
-        }
-        await using (var update = new SqlCommand("UPDATE pos.till SET status='OPEN',version=version+1 WHERE id=@id", connection, transaction))
-        {
-            update.Parameters.AddWithValue("id", request.TillId);
-            await update.ExecuteNonQueryAsync(ct);
-        }
-        await transaction.CommitAsync(ct);
-        return id;
+        if (string.IsNullOrWhiteSpace(request.CashierName)) throw new ArgumentException("Cashier name is required."); if (request.OpeningFloat < 0) throw new ArgumentException("Opening float cannot be negative.");
+        await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
+        var till=await db.Tills.SingleOrDefaultAsync(x=>x.Id==request.TillId,ct) ?? throw new ArgumentException($"Till not found: {request.TillId}");
+        if (await db.CashSessions.AnyAsync(x=>x.TillId==request.TillId && x.Status=="OPEN",ct)) throw new InvalidOperationException("Till already has an open cash session.");
+        var id=Guid.NewGuid(); db.CashSessions.Add(new CashSessionEntity { Id=id,TillId=request.TillId,CashierName=request.CashierName.Trim(),OpeningFloat=request.OpeningFloat,ExpectedCash=request.OpeningFloat,Status="OPEN",OpenedAt=DateTimeOffset.UtcNow }); till.Status="OPEN"; till.Version++;
+        await db.SaveChangesAsync(ct); await tx.CommitAsync(ct); return id;
     }
 
-    public async Task<SessionView> GetSession(Guid id, CancellationToken ct)
-    {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("SELECT id,till_id,status,expected_cash FROM pos.cash_session WHERE id=@id", connection);
-        command.Parameters.AddWithValue("id", id);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? ReadSession(reader) : throw new ArgumentException($"Cash session not found: {id}");
-    }
-
-    public async Task<SessionView?> GetActiveSession(Guid tillId, CancellationToken ct)
-    {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("SELECT id,till_id,status,expected_cash FROM pos.cash_session WHERE till_id=@id AND status='OPEN' ORDER BY opened_at DESC LIMIT 1", connection);
-        command.Parameters.AddWithValue("id", tillId);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? ReadSession(reader) : null;
-    }
+    public async Task<SessionView> GetSession(Guid id, CancellationToken ct) { var s=await db.CashSessions.AsNoTracking().SingleOrDefaultAsync(x=>x.Id==id,ct) ?? throw new ArgumentException($"Cash session not found: {id}"); return Session(s); }
+    public async Task<SessionView?> GetActiveSession(Guid tillId, CancellationToken ct) { var s=await db.CashSessions.AsNoTracking().Where(x=>x.TillId==tillId&&x.Status=="OPEN").OrderByDescending(x=>x.OpenedAt).FirstOrDefaultAsync(ct); return s is null?null:Session(s); }
 
     public async Task<bool> CloseSession(Guid id, CloseSessionRequest request, CancellationToken ct)
     {
-        if (request.CountedCash < 0) throw new ArgumentException("Counted cash cannot be negative.");
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        Guid tillId;
-        decimal expectedCash;
-        await using (var session = new SqlCommand("SELECT till_id,status FROM pos.cash_session WHERE id=@id FOR UPDATE", connection, transaction))
-        {
-            session.Parameters.AddWithValue("id", id);
-            await using var reader = await session.ExecuteReaderAsync(ct);
-            if (!await reader.ReadAsync(ct)) throw new ArgumentException($"Cash session not found: {id}");
-            var status = reader.GetString(1);
-            if (status != "OPEN") throw new InvalidOperationException($"Cash session is not open: {id}");
-            tillId = reader.GetGuid(0);
-            await reader.CloseAsync();
-            await using var expected = new SqlCommand("SELECT expected_cash FROM pos.cash_session WHERE id=@id", connection, transaction);
-            expected.Parameters.AddWithValue("id", id);
-            expectedCash = (decimal)(await expected.ExecuteScalarAsync(ct) ?? 0m);
-        }
-        await using (var close = new SqlCommand("UPDATE pos.cash_session SET counted_cash=@cash,status='CLOSED',closed_at=@now,version=version+1 WHERE id=@id", connection, transaction))
-        {
-            close.Parameters.AddWithValue("cash", request.CountedCash);
-            close.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-            close.Parameters.AddWithValue("id", id);
-            await close.ExecuteNonQueryAsync(ct);
-        }
-        await using (var updateTill = new SqlCommand("UPDATE pos.till SET status='CLOSED',version=version+1 WHERE id=@id", connection, transaction))
-        {
-            updateTill.Parameters.AddWithValue("id", tillId);
-            await updateTill.ExecuteNonQueryAsync(ct);
-        }
-        await OutboxWriter.Write(connection, transaction, "CashSessionClosed",
-            new CashSessionClosedEvent(id, expectedCash, request.CountedCash), ct);
-        await transaction.CommitAsync(ct);
-        return true;
+        if(request.CountedCash<0) throw new ArgumentException("Counted cash cannot be negative."); await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);
+        var s=await db.CashSessions.SingleOrDefaultAsync(x=>x.Id==id,ct) ?? throw new ArgumentException($"Cash session not found: {id}"); if(s.Status!="OPEN") throw new InvalidOperationException($"Cash session is not open: {id}"); var expected=s.ExpectedCash;
+        s.CountedCash=request.CountedCash;s.Status="CLOSED";s.ClosedAt=DateTimeOffset.UtcNow;s.Version++; var till=await db.Tills.SingleAsync(x=>x.Id==s.TillId,ct);till.Status="CLOSED";till.Version++;
+        await db.SaveChangesAsync(ct); await OutboxWriter.Write(db, "CashSessionClosed", new CashSessionClosedEvent(id,expected,request.CountedCash),ct); await tx.CommitAsync(ct); return true;
     }
 
     public async Task<Guid> StartTransaction(StartTransactionRequest request, CancellationToken ct)
-    {
-        var id = Guid.NewGuid();
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var session = new SqlCommand("SELECT status FROM pos.cash_session WHERE id=@id FOR UPDATE", connection, transaction))
-        {
-            session.Parameters.AddWithValue("id", request.CashSessionId);
-            if (await session.ExecuteScalarAsync(ct) as string != "OPEN") throw new InvalidOperationException("Cash session is not open.");
-        }
-        await using var insert = new SqlCommand("INSERT INTO pos.pos_transaction(id,cash_session_id,status,payment_method,started_at,completed_at,version) VALUES(@id,@session,'IN_PROGRESS',NULL,@now,NULL,0)", connection, transaction);
-        insert.Parameters.AddWithValue("id", id);
-        insert.Parameters.AddWithValue("session", request.CashSessionId);
-        insert.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-        await insert.ExecuteNonQueryAsync(ct);
-        await transaction.CommitAsync(ct);
-        return id;
-    }
-
-    public async Task<IReadOnlyList<TransactionView>> ListTransactions(CancellationToken ct)
-    {
-        var ids = new List<Guid>();
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("SELECT id FROM pos.pos_transaction ORDER BY started_at DESC", connection);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct)) ids.Add(reader.GetGuid(0));
-        var list = new List<TransactionView>(ids.Count);
-        foreach (var id in ids) if (await GetTransaction(id, ct) is { } ticket) list.Add(ticket);
-        return list;
-    }
-
-    public async Task<TransactionView> GetTransaction(Guid id, CancellationToken ct)
-    {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var ticket = new SqlCommand("SELECT id,cash_session_id,status,payment_method,started_at,completed_at FROM pos.pos_transaction WHERE id=@id", connection);
-        ticket.Parameters.AddWithValue("id", id);
-        await using var reader = await ticket.ExecuteReaderAsync(ct);
-        if (!await reader.ReadAsync(ct)) throw new ArgumentException($"Ticket not found: {id}");
-        var cashSessionId = reader.GetGuid(1);
-        var status = reader.GetString(2);
-        var method = reader.IsDBNull(3) ? null : reader.GetString(3);
-        var started = JavaInstantFormat.Format(AsInstant(reader.GetDateTime(4)));
-        var completed = reader.IsDBNull(5) ? null : JavaInstantFormat.Format(AsInstant(reader.GetDateTime(5)));
-        await reader.CloseAsync();
-        var lines = await ReadLines(id, connection, ct);
-        var total = lines.Sum(x => ParseMoney(x.LineTotal));
-        var vat = lines.Sum(x => ParseMoney(x.VatAmount));
-        return new TransactionView(id, cashSessionId, status, FormatMoney(total), FormatMoney(total - vat),
-            FormatMoney(vat), method, started, completed, lines);
-    }
+    { await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct); var s=await db.CashSessions.SingleOrDefaultAsync(x=>x.Id==request.CashSessionId,ct); if(s?.Status!="OPEN") throw new InvalidOperationException("Cash session is not open."); var id=Guid.NewGuid();db.PosTransactions.Add(new PosTransactionEntity{Id=id,CashSessionId=request.CashSessionId,Status="IN_PROGRESS",StartedAt=DateTimeOffset.UtcNow});await db.SaveChangesAsync(ct);await tx.CommitAsync(ct);return id; }
+    public async Task<IReadOnlyList<TransactionView>> ListTransactions(CancellationToken ct) { var ids=await db.PosTransactions.AsNoTracking().OrderByDescending(x=>x.StartedAt).Select(x=>x.Id).ToListAsync(ct); var list=new List<TransactionView>(); foreach(var id in ids) list.Add(await GetTransaction(id,ct)); return list; }
+    public async Task<TransactionView> GetTransaction(Guid id,CancellationToken ct) { var t=await db.PosTransactions.AsNoTracking().SingleOrDefaultAsync(x=>x.Id==id,ct)??throw new ArgumentException($"Ticket not found: {id}"); var lines=await ReadLines(id,ct);var total=lines.Sum(x=>ParseMoney(x.LineTotal));var vat=lines.Sum(x=>ParseMoney(x.VatAmount));return new(id,t.CashSessionId,t.Status,FormatMoney(total),FormatMoney(total-vat),FormatMoney(vat),t.PaymentMethod,JavaInstantFormat.Format(t.StartedAt),t.CompletedAt is null?null:JavaInstantFormat.Format(t.CompletedAt.Value),lines); }
 
     public async Task<AddLineResponse> AddLine(Guid transactionId, AddLineRequest request, CancellationToken ct)
     {
-        ValidateQuantity(request.QuantityValue, request.UnitType);
-        var unit = request.UnitType.Trim().ToUpperInvariant();
-        var quantityValue = unit == "WEIGHT"
-            ? decimal.Round(request.QuantityValue, 3, MidpointRounding.AwayFromZero)
-            : request.QuantityValue;
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        Guid sessionId;
-        await using (var ticket = new SqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id AND status='IN_PROGRESS' FOR UPDATE", connection, transaction))
-        {
-            ticket.Parameters.AddWithValue("id", transactionId);
-            var value = await ticket.ExecuteScalarAsync(ct);
-            if (value is null) throw new ArgumentException("Ticket not found or is not in progress.");
-            sessionId = (Guid)value;
-        }
-        await RequireOpenSession(connection, transaction, sessionId, ct);
-
-        decimal vatRate;
-        string productUnit;
-        await using (var product = new SqlCommand("SELECT unit_type,vat_rate FROM inventory.product WHERE id=@id", connection, transaction))
-        {
-            product.Parameters.AddWithValue("id", request.ProductId);
-            await using var reader = await product.ExecuteReaderAsync(ct);
-            if (!await reader.ReadAsync(ct)) throw new ArgumentException($"Product not found: {request.ProductId}");
-            productUnit = reader.GetString(0);
-            vatRate = reader.IsDBNull(1) ? 19m : reader.GetDecimal(1);
-        }
-        if (!productUnit.Equals(unit, StringComparison.Ordinal)) throw new ArgumentException("Requested unit type does not match the product.");
-
-        decimal unitPrice;
-        await using (var price = new SqlCommand("SELECT unit_price FROM pricing.product_price WHERE product_id=@id", connection, transaction))
-        {
-            price.Parameters.AddWithValue("id", request.ProductId);
-            var result = await price.ExecuteScalarAsync(ct);
-            if (result is not decimal value) throw new ArgumentException($"No price defined for product: {request.ProductId}");
-            unitPrice = value;
-        }
-        decimal net = decimal.Round(unitPrice * quantityValue, 3, MidpointRounding.AwayFromZero);
-        await using (var promo = new SqlCommand("""
-            SELECT discount_percent FROM pricing.promotion
-            WHERE product_id=@id AND active=1 AND valid_from<=@now AND valid_until>=@now
-            ORDER BY valid_from LIMIT 1
-            """, connection, transaction))
-        {
-            promo.Parameters.AddWithValue("id", request.ProductId);
-            promo.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-            var discount = await promo.ExecuteScalarAsync(ct);
-            if (discount is decimal percent)
-            {
-                var discountFraction = decimal.Round(percent / 100m, 4, MidpointRounding.AwayFromZero);
-                net = decimal.Round(net * (1m - discountFraction), 3, MidpointRounding.AwayFromZero);
-            }
-        }
-        var vat = decimal.Round(net * vatRate / 100m, 3, MidpointRounding.AwayFromZero);
-        var gross = net + vat;
-        var lineId = Guid.NewGuid();
-        await using (var insert = new SqlCommand("""
-            INSERT INTO pos.transaction_line(id,transaction_id,product_id,value,unit_type,line_total,vat_amount)
-            VALUES(@id,@transaction,@product,@quantity,@unit,@total,@vat)
-            """, connection, transaction))
-        {
-            insert.Parameters.AddWithValue("id", lineId);
-            insert.Parameters.AddWithValue("transaction", transactionId);
-            insert.Parameters.AddWithValue("product", request.ProductId);
-            insert.Parameters.AddWithValue("quantity", quantityValue);
-            insert.Parameters.AddWithValue("unit", unit == "EACH" ? (short)0 : (short)1);
-            insert.Parameters.AddWithValue("total", gross);
-            insert.Parameters.AddWithValue("vat", vat);
-            await insert.ExecuteNonQueryAsync(ct);
-        }
-        await using (var version = new SqlCommand("UPDATE pos.pos_transaction SET version=version+1 WHERE id=@id", connection, transaction))
-        {
-            version.Parameters.AddWithValue("id", transactionId);
-            await version.ExecuteNonQueryAsync(ct);
-        }
-        await transaction.CommitAsync(ct);
-        return new AddLineResponse(FormatMoney(gross), FormatMoney(net), FormatMoney(vat), lineId.ToString());
+        ValidateQuantity(request.QuantityValue,request.UnitType);var unit=request.UnitType.Trim().ToUpperInvariant();var quantity=unit=="WEIGHT"?decimal.Round(request.QuantityValue,3,MidpointRounding.AwayFromZero):request.QuantityValue;
+        await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);var ticket=await db.PosTransactions.SingleOrDefaultAsync(x=>x.Id==transactionId&&x.Status=="IN_PROGRESS",ct)??throw new ArgumentException("Ticket not found or is not in progress.");await RequireOpenSession(ticket.CashSessionId,ct);
+        var p=await db.Products.AsNoTracking().SingleOrDefaultAsync(x=>x.Id==request.ProductId,ct)??throw new ArgumentException($"Product not found: {request.ProductId}");if(!p.UnitType.Equals(unit,StringComparison.Ordinal))throw new ArgumentException("Requested unit type does not match the product.");var price=await db.ProductPrices.AsNoTracking().Where(x=>x.ProductId==request.ProductId).Select(x=>x.UnitPrice).SingleOrDefaultAsync(ct)??throw new ArgumentException($"No price defined for product: {request.ProductId}");var now=DateTimeOffset.UtcNow;var discount=await db.Promotions.AsNoTracking().Where(x=>x.ProductId==request.ProductId&&x.Active&&x.ValidFrom<=now&&x.ValidUntil>=now).OrderBy(x=>x.ValidFrom).Select(x=>(decimal?)x.DiscountPercent).FirstOrDefaultAsync(ct);var net=decimal.Round(price*quantity,3,MidpointRounding.AwayFromZero);if(discount is decimal d)net=decimal.Round(net*(1m-decimal.Round(d/100m,4,MidpointRounding.AwayFromZero)),3,MidpointRounding.AwayFromZero);var vat=decimal.Round(net*(p.VatRate??19m)/100m,3,MidpointRounding.AwayFromZero);var gross=net+vat;var lineId=Guid.NewGuid();db.TransactionLines.Add(new TransactionLineEntity{Id=lineId,TransactionId=transactionId,ProductId=request.ProductId,Quantity=quantity,UnitType=unit=="EACH"?(short)0:(short)1,LineTotal=gross,VatAmount=vat});ticket.Version++;await db.SaveChangesAsync(ct);await tx.CommitAsync(ct);return new(FormatMoney(gross),FormatMoney(net),FormatMoney(vat),lineId.ToString());
     }
 
-    public async Task<bool> RemoveLine(Guid transactionId, Guid lineId, CancellationToken ct)
+    public async Task<bool> RemoveLine(Guid transactionId,Guid lineId,CancellationToken ct){await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);var t=await db.PosTransactions.SingleOrDefaultAsync(x=>x.Id==transactionId,ct)??throw new ArgumentException($"Ticket not found: {transactionId}");if(t.Status!="IN_PROGRESS")throw new InvalidOperationException("Only in-progress tickets can be changed.");var line=await db.TransactionLines.SingleOrDefaultAsync(x=>x.Id==lineId&&x.TransactionId==transactionId,ct);if(line is null){await tx.CommitAsync(ct);return false;}db.TransactionLines.Remove(line);t.Version++;await db.SaveChangesAsync(ct);await tx.CommitAsync(ct);return true;}
+
+    public async Task Complete(Guid id,CompleteTransactionRequest request,CancellationToken ct)
     {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        await RequireInProgress(connection, transaction, transactionId, ct);
-        await using var delete = new SqlCommand("DELETE FROM pos.transaction_line WHERE transaction_id=@transaction AND id=@line", connection, transaction);
-        delete.Parameters.AddWithValue("transaction", transactionId);
-        delete.Parameters.AddWithValue("line", lineId);
-        var changed = await delete.ExecuteNonQueryAsync(ct) != 0;
-        if (changed)
-        {
-            await using var version = new SqlCommand("UPDATE pos.pos_transaction SET version=version+1 WHERE id=@id", connection, transaction);
-            version.Parameters.AddWithValue("id", transactionId);
-            await version.ExecuteNonQueryAsync(ct);
-        }
-        await transaction.CommitAsync(ct);
-        return changed;
+        var method=request.PaymentMethod.Trim().ToUpperInvariant();if(method is not("CASH" or "CARD"))throw new ArgumentException("Payment method must be CASH or CARD.");await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);var t=await db.PosTransactions.SingleOrDefaultAsync(x=>x.Id==id&&x.Status=="IN_PROGRESS",ct)??throw new InvalidOperationException("Only in-progress tickets can be completed.");await RequireOpenSession(t.CashSessionId,ct);var lines=await db.TransactionLines.Where(x=>x.TransactionId==id).ToListAsync(ct);var total=lines.Sum(x=>x.LineTotal);if(request.AmountReceived is decimal tender&&((method=="CASH"&&tender<total)||(method=="CARD"&&tender!=total)))throw new ArgumentException(method=="CASH"?"Cash received is less than the transaction total.":"Card amount must equal the transaction total.");decimal cogs=0;foreach(var line in lines)cogs+=await SellFromStock(line.ProductId,line.Quantity,line.UnitType,ct);var net=lines.Sum(x=>x.LineTotal-x.VatAmount);var vat=lines.Sum(x=>x.VatAmount);t.Status="COMPLETED";t.PaymentMethod=method;t.CompletedAt=DateTimeOffset.UtcNow;t.Version++;if(method=="CASH"){var s=await db.CashSessions.SingleAsync(x=>x.Id==t.CashSessionId,ct);s.ExpectedCash+=total;s.Version++;}await db.SaveChangesAsync(ct);await OutboxWriter.Write(db,"SaleCompleted",new SaleCompletedEvent(id,t.CashSessionId,method,net,vat,total,cogs),ct);await tx.CommitAsync(ct);
     }
 
-    public async Task Complete(Guid id, CompleteTransactionRequest request, CancellationToken ct)
+    public async Task<bool> Void(Guid id,VoidTransactionRequest request,CancellationToken ct){await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);var t=await db.PosTransactions.SingleOrDefaultAsync(x=>x.Id==id,ct)??throw new ArgumentException($"Ticket not found: {id}");if(t.Status!="IN_PROGRESS")throw new InvalidOperationException("Only in-progress tickets can be changed.");await RequireOpenSession(t.CashSessionId,ct);t.Status="VOIDED";t.Version++;await db.SaveChangesAsync(ct);await tx.CommitAsync(ct);return true;}
+    public async Task<bool> DeleteTransaction(Guid id,CancellationToken ct){await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);var t=await db.PosTransactions.SingleOrDefaultAsync(x=>x.Id==id,ct)??throw new ArgumentException($"Ticket not found: {id}");if(t.Status!="IN_PROGRESS")throw new InvalidOperationException("Only in-progress tickets can be changed.");await RequireOpenSession(t.CashSessionId,ct);db.PosTransactions.Remove(t);await db.SaveChangesAsync(ct);await tx.CommitAsync(ct);return true;}
+
+    private async Task<decimal> SellFromStock(Guid productId,decimal requested,short unit,CancellationToken ct){var stock=await db.StockLevels.SingleOrDefaultAsync(x=>x.ProductId==productId,ct)??throw new InvalidOperationException($"No stock found for product: {productId}");var lots=await (from e in db.LotEntries join l in db.Lots on e.LotId equals l.Id where e.StockLevelId==stock.Id&&e.OnHandUnitType==unit orderby l.ExpiryDate==null,l.ExpiryDate,l.ReceivedDate,l.Id select new{e,l}).ToListAsync(ct);var available=lots.Sum(x=>(x.e.OnHandValue ?? 0m)-(x.e.ReservedValue ?? 0m));if(available<requested)throw new InvalidOperationException($"Insufficient stock for product {productId}: requested {requested}, available {available}.");var remaining=requested;decimal cost=0;foreach(var x in lots){if(remaining<=0)break;var take=Math.Min(remaining,(x.e.OnHandValue ?? 0m)-(x.e.ReservedValue ?? 0m));if(take<=0)continue;cost=decimal.Round(cost+take*x.l.UnitCost,3,MidpointRounding.AwayFromZero);x.e.OnHandValue=(x.e.OnHandValue ?? 0m)-take;remaining-=take;}stock.Version++;var onHand=await (from e in db.LotEntries where e.StockLevelId==stock.Id select (e.OnHandValue ?? 0m)-(e.ReservedValue ?? 0m)).SumAsync(ct);var product=await db.Products.AsNoTracking().SingleAsync(x=>x.Id==productId,ct);if(onHand<=product.ReorderPoint) { await db.SaveChangesAsync(ct); await OutboxWriter.Write(db,"LowStockThresholdReached",productId,ct); } return cost;}
+    private async Task<IReadOnlyList<PosLineView>> ReadLines(Guid id,CancellationToken ct)
     {
-        var method = request.PaymentMethod.Trim().ToUpperInvariant();
-        if (method is not ("CASH" or "CARD")) throw new ArgumentException("Payment method must be CASH or CARD.");
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        Guid sessionId;
-        await using (var ticket = new SqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id AND status='IN_PROGRESS' FOR UPDATE", connection, transaction))
-        {
-            ticket.Parameters.AddWithValue("id", id);
-            var value = await ticket.ExecuteScalarAsync(ct);
-            if (value is null) throw new InvalidOperationException("Only in-progress tickets can be completed.");
-            sessionId = (Guid)value;
-        }
-        await RequireOpenSession(connection, transaction, sessionId, ct);
-        decimal total;
-        await using (var amount = new SqlCommand("SELECT COALESCE(SUM(line_total),0) FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
-        {
-            amount.Parameters.AddWithValue("id", id);
-            total = (decimal)(await amount.ExecuteScalarAsync(ct) ?? 0m);
-        }
-        if (request.AmountReceived is decimal tender
-            && ((method == "CASH" && tender < total) || (method == "CARD" && tender != total)))
-            throw new ArgumentException(method == "CASH" ? "Cash received is less than the transaction total." : "Card amount must equal the transaction total.");
-
-        var lines = new List<(Guid Product, decimal Quantity, short Unit)>();
-        await using (var query = new SqlCommand("SELECT product_id,value,unit_type FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
-        {
-            query.Parameters.AddWithValue("id", id);
-            await using var reader = await query.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) lines.Add((reader.GetGuid(0), reader.GetDecimal(1), reader.GetInt16(2)));
-        }
-        decimal cogs = 0;
-        foreach (var line in lines) cogs += await SellFromStock(connection, transaction, line.Product, line.Quantity, line.Unit, ct);
-        decimal netAmount;
-        decimal vatAmount;
-        await using (var totals = new SqlCommand("SELECT COALESCE(SUM(line_total-vat_amount),0),COALESCE(SUM(vat_amount),0) FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
-        {
-            totals.Parameters.AddWithValue("id", id);
-            await using var reader = await totals.ExecuteReaderAsync(ct);
-            await reader.ReadAsync(ct);
-            netAmount = reader.GetDecimal(0);
-            vatAmount = reader.GetDecimal(1);
-        }
-        await using (var complete = new SqlCommand("UPDATE pos.pos_transaction SET status='COMPLETED',payment_method=@method,completed_at=@now,version=version+1 WHERE id=@id", connection, transaction))
-        {
-            complete.Parameters.AddWithValue("method", method);
-            complete.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-            complete.Parameters.AddWithValue("id", id);
-            await complete.ExecuteNonQueryAsync(ct);
-        }
-        if (method == "CASH")
-        {
-            await using var cash = new SqlCommand("UPDATE pos.cash_session SET expected_cash=expected_cash+@total,version=version+1 WHERE id=@id", connection, transaction);
-            cash.Parameters.AddWithValue("total", total);
-            cash.Parameters.AddWithValue("id", sessionId);
-            await cash.ExecuteNonQueryAsync(ct);
-        }
-        await OutboxWriter.Write(connection, transaction, "SaleCompleted",
-            new SaleCompletedEvent(id, sessionId, method, netAmount, vatAmount, total, cogs), ct);
-        await transaction.CommitAsync(ct);
+        var lines = await db.TransactionLines.AsNoTracking().Where(x => x.TransactionId == id).OrderBy(x => x.Id).ToListAsync(ct);
+        return lines.Select(x => new PosLineView(x.Id, x.ProductId,
+            x.UnitType == 0 ? $"{x.Quantity:0} unit(s)" : $"{x.Quantity:0.000} kg",
+            FormatMoney(x.LineTotal), FormatMoney(x.LineTotal - x.VatAmount), FormatMoney(x.VatAmount))).ToList();
     }
-
-    public async Task<bool> Void(Guid id, VoidTransactionRequest request, CancellationToken ct)
-    {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        await RequireInProgress(connection, transaction, id, ct);
-        var session = await GetTransactionSession(connection, transaction, id, ct);
-        await RequireOpenSession(connection, transaction, session, ct);
-        await using var command = new SqlCommand("UPDATE pos.pos_transaction SET status='VOIDED',version=version+1 WHERE id=@id", connection, transaction);
-        command.Parameters.AddWithValue("id", id);
-        var changed = await command.ExecuteNonQueryAsync(ct) != 0;
-        await transaction.CommitAsync(ct);
-        return changed;
-    }
-
-    public async Task<bool> DeleteTransaction(Guid id, CancellationToken ct)
-    {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        await RequireInProgress(connection, transaction, id, ct);
-        var session = await GetTransactionSession(connection, transaction, id, ct);
-        await RequireOpenSession(connection, transaction, session, ct);
-        await using (var lines = new SqlCommand("DELETE FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
-        {
-            lines.Parameters.AddWithValue("id", id);
-            await lines.ExecuteNonQueryAsync(ct);
-        }
-        await using var command = new SqlCommand("DELETE FROM pos.pos_transaction WHERE id=@id", connection, transaction);
-        command.Parameters.AddWithValue("id", id);
-        var changed = await command.ExecuteNonQueryAsync(ct) != 0;
-        await transaction.CommitAsync(ct);
-        return changed;
-    }
-
-    private static async Task<decimal> SellFromStock(SqlConnection connection, SqlTransaction tx, Guid productId,
-        decimal requested, short unit, CancellationToken ct)
-    {
-        await using var stock = new SqlCommand("SELECT id FROM inventory.stock_level WHERE product_id=@id FOR UPDATE", connection, tx);
-        stock.Parameters.AddWithValue("id", productId);
-        var stockId = await stock.ExecuteScalarAsync(ct);
-        if (stockId is null) throw new InvalidOperationException($"No stock found for product: {productId}");
-        var lots = new List<(Guid EntryId, decimal OnHand, decimal Reserved, decimal UnitCost)>();
-        await using (var query = new SqlCommand("""
-            SELECT le.id,le.on_hand_value,le.reserved_value,l.unit_cost
-            FROM inventory.lot_entry le JOIN inventory.lot l ON l.id=le.lot_id
-            WHERE le.stock_level_id=@id AND le.on_hand_unit_type=@unit
-            ORDER BY l.expiry_date NULLS LAST,l.received_date,l.id FOR UPDATE OF le
-            """, connection, tx))
-        {
-            query.Parameters.AddWithValue("id", (Guid)stockId);
-            query.Parameters.AddWithValue("unit", unit);
-            await using var reader = await query.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) lots.Add((reader.GetGuid(0), reader.GetDecimal(1), reader.GetDecimal(2), reader.GetDecimal(3)));
-        }
-        var available = lots.Sum(x => x.OnHand - x.Reserved);
-        if (available < requested) throw new InvalidOperationException($"Insufficient stock for product {productId}: requested {requested}, available {available}.");
-        var remaining = requested;
-        decimal cost = 0;
-        foreach (var lot in lots)
-        {
-            if (remaining <= 0) break;
-            var take = Math.Min(remaining, lot.OnHand - lot.Reserved);
-            if (take <= 0) continue;
-            cost = decimal.Round(cost + take * lot.UnitCost, 3, MidpointRounding.AwayFromZero);
-            await using var update = new SqlCommand("UPDATE inventory.lot_entry SET on_hand_value=on_hand_value-@quantity WHERE id=@id", connection, tx);
-            update.Parameters.AddWithValue("quantity", take);
-            update.Parameters.AddWithValue("id", lot.EntryId);
-            await update.ExecuteNonQueryAsync(ct);
-            remaining -= take;
-        }
-        await using var version = new SqlCommand("UPDATE inventory.stock_level SET version=version+1 WHERE id=@id", connection, tx);
-        version.Parameters.AddWithValue("id", (Guid)stockId);
-        await version.ExecuteNonQueryAsync(ct);
-        await using var product = new SqlCommand("SELECT COALESCE(p.reorder_point,0),COALESCE(SUM(le.on_hand_value-le.reserved_value),0) FROM inventory.product p LEFT JOIN inventory.stock_level sl ON sl.product_id=p.id LEFT JOIN inventory.lot_entry le ON le.stock_level_id=sl.id WHERE p.id=@id GROUP BY p.id", connection, tx);
-        product.Parameters.AddWithValue("id", productId);
-        await using var productReader = await product.ExecuteReaderAsync(ct);
-        if (await productReader.ReadAsync(ct) && productReader.GetDecimal(1) <= productReader.GetInt32(0))
-        {
-            await productReader.CloseAsync();
-            await OutboxWriter.Write(connection, tx, "LowStockThresholdReached", productId, ct);
-        }
-        return cost;
-    }
-
-    private static async Task<IReadOnlyList<PosLineView>> ReadLines(Guid transactionId, SqlConnection connection, CancellationToken ct)
-    {
-        var lines = new List<PosLineView>();
-        await using var command = new SqlCommand("SELECT id,product_id,value,unit_type,line_total,vat_amount FROM pos.transaction_line WHERE transaction_id=@id ORDER BY id", connection);
-        command.Parameters.AddWithValue("id", transactionId);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            var quantity = reader.GetDecimal(2);
-            var unit = reader.GetInt16(3) == 0 ? "EACH" : "WEIGHT";
-            lines.Add(new PosLineView(reader.GetGuid(0), reader.GetGuid(1),
-                unit == "EACH" ? $"{quantity:0} unit(s)" : $"{quantity:0.000} kg",
-                FormatMoney(reader.GetDecimal(4)), FormatMoney(reader.GetDecimal(4) - reader.GetDecimal(5)), FormatMoney(reader.GetDecimal(5))));
-        }
-        return lines;
-    }
-
-    private static async Task RequireInProgress(SqlConnection c, SqlTransaction tx, Guid id, CancellationToken ct)
-    {
-        await using var command = new SqlCommand("SELECT status FROM pos.pos_transaction WHERE id=@id FOR UPDATE", c, tx);
-        command.Parameters.AddWithValue("id", id);
-        var status = await command.ExecuteScalarAsync(ct) as string ?? throw new ArgumentException($"Ticket not found: {id}");
-        if (status != "IN_PROGRESS") throw new InvalidOperationException("Only in-progress tickets can be changed.");
-    }
-
-    private static async Task<Guid> GetTransactionSession(SqlConnection c, SqlTransaction tx, Guid id, CancellationToken ct)
-    {
-        await using var command = new SqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id", c, tx);
-        command.Parameters.AddWithValue("id", id);
-        return (Guid)(await command.ExecuteScalarAsync(ct) ?? throw new ArgumentException("Ticket not found."));
-    }
-
-    private static async Task RequireOpenSession(SqlConnection c, SqlTransaction tx, Guid id, CancellationToken ct)
-    {
-        await using var command = new SqlCommand("SELECT status FROM pos.cash_session WHERE id=@id FOR UPDATE", c, tx);
-        command.Parameters.AddWithValue("id", id);
-        var status = await command.ExecuteScalarAsync(ct) as string ?? throw new ArgumentException($"Cash session not found: {id}");
-        if (status != "OPEN") throw new InvalidOperationException("Cash session is not open.");
-    }
-
-    private static TillView ReadTill(SqlDataReader r) => new(r.GetGuid(0), r.GetString(1), r.GetString(2),
-        r.IsDBNull(3) ? null : r.GetString(3), FormatMoney(r.GetDecimal(4)),
-        r.IsDBNull(5) ? null : JavaInstantFormat.Format(AsInstant(r.GetDateTime(5))),
-        r.IsDBNull(6) ? null : JavaInstantFormat.Format(AsInstant(r.GetDateTime(6))));
-
-    private static SessionView ReadSession(SqlDataReader r) =>
-        new(r.GetGuid(0), r.GetGuid(1), r.GetString(2), FormatMoney(r.GetDecimal(3)));
-
-    private static void ValidateQuantity(decimal value, string unitType)
-    {
-        var unit = unitType.Trim().ToUpperInvariant();
-        if (value <= 0) throw new ArgumentException("Quantity must be positive.");
-        if (unit is not ("EACH" or "WEIGHT")) throw new ArgumentException("Unit type must be EACH or WEIGHT.");
-        if (unit == "EACH" && value != decimal.Truncate(value)) throw new ArgumentException("EACH quantity must be a whole number.");
-        // The Java Quantity value object rounds weighted quantities to 3 decimals using HALF_UP.
-    }
-
-    private static string FormatMoney(decimal amount) => $"{amount.ToString("0.000", CultureInfo.InvariantCulture)} TND";
-    private static decimal ParseMoney(string value) => decimal.Parse(value[..^4], CultureInfo.InvariantCulture);
-    private static DateTimeOffset AsInstant(DateTime value) => new(DateTime.SpecifyKind(value, DateTimeKind.Utc));
+    private async Task RequireOpenSession(Guid id,CancellationToken ct){var s=await db.CashSessions.SingleOrDefaultAsync(x=>x.Id==id,ct)??throw new ArgumentException($"Cash session not found: {id}");if(s.Status!="OPEN")throw new InvalidOperationException("Cash session is not open.");}
+    private static SessionView Session(CashSessionEntity s)=>new(s.Id,s.TillId,s.Status,FormatMoney(s.ExpectedCash));
+    private static void ValidateQuantity(decimal value,string unit){unit=unit.Trim().ToUpperInvariant();if(value<=0)throw new ArgumentException("Quantity must be positive.");if(unit is not("EACH" or "WEIGHT"))throw new ArgumentException("Unit type must be EACH or WEIGHT.");if(unit=="EACH"&&value!=decimal.Truncate(value))throw new ArgumentException("EACH quantity must be a whole number.");}
+    private static string FormatMoney(decimal amount)=>$"{amount.ToString("0.000",CultureInfo.InvariantCulture)} TND";private static decimal ParseMoney(string value)=>decimal.Parse(value[..^4],CultureInfo.InvariantCulture);
 }
 
-public sealed class ScannerPairingService(SqlServerDataSource dataSource, PosRepository pos)
+public sealed class ScannerPairingService(BusinessDbContext db, PosRepository pos)
 {
     private static readonly TimeSpan Lifetime = TimeSpan.FromMinutes(30);
     private readonly ConcurrentDictionary<Guid, Pairing> _sessions = new();
@@ -635,16 +217,12 @@ public sealed class ScannerPairingService(SqlServerDataSource dataSource, PosRep
             ?? throw new ArgumentException("Scanner ticket no longer exists.");
         if (transaction.Status != "IN_PROGRESS") throw new InvalidOperationException("Only an in-progress ticket can use the phone scanner.");
         var barcode = rawBarcode?.Trim() ?? "";
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("SELECT id,sku,name,unit_type FROM inventory.product WHERE lower(sku)=lower(@sku)", connection);
-        command.Parameters.AddWithValue("sku", barcode);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        if (!await reader.ReadAsync(ct)) throw new ArgumentException($"No product found for barcode: {barcode}");
-        var productId = reader.GetGuid(0);
-        var sku = reader.GetString(1);
-        var name = reader.GetString(2);
-        var unit = reader.GetString(3);
-        await reader.CloseAsync();
+        var product = await db.Products.AsNoTracking().SingleOrDefaultAsync(x => x.Sku.ToLower() == barcode.ToLower(), ct)
+            ?? throw new ArgumentException($"No product found for barcode: {barcode}");
+        var productId = product.Id;
+        var sku = product.Sku;
+        var name = product.Name;
+        var unit = product.UnitType;
         var quantity = unit == "WEIGHT" ? 0.1m : 1m;
         var line = await pos.AddLine(pairing.TransactionId, new AddLineRequest(productId, quantity, unit), ct);
         return new ScannerScanResult(barcode, productId, sku, name, unit,

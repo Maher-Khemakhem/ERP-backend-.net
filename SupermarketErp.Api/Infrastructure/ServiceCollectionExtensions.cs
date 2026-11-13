@@ -32,6 +32,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton(new SqlServerDataSource(DatabaseConnectionString.Create(configuration)));
         services.AddDbContext<AuthDbContext>((serviceProvider, options) =>
             options.UseSqlServer(serviceProvider.GetRequiredService<SqlServerDataSource>().ConnectionString));
+        services.AddDbContext<BusinessDbContext>((serviceProvider, options) =>
+            options.UseSqlServer(serviceProvider.GetRequiredService<SqlServerDataSource>().ConnectionString));
         services.AddScoped<AuthService>();
         services.AddScoped<ProductRepository>();
         services.AddScoped<InventoryRepository>();

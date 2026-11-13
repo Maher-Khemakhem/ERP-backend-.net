@@ -1,378 +1,112 @@
-﻿using Microsoft.Data.SqlClient;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using SupermarketErp.Api.Infrastructure;
 
 namespace SupermarketErp.Api.Features.Procurement;
-public sealed class ProcurementRepository(SqlServerDataSource dataSource)
-{
-    public async Task<IReadOnlyList<SupplierView>> ListSuppliers(CancellationToken ct)
-    {
-        var list = new List<SupplierView>();
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("SELECT id,name,contact_email,contact_phone,address FROM procurement.supplier ORDER BY name", connection);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct)) list.Add(ReadSupplier(reader));
-        return list;
-    }
 
-    public async Task<SupplierView?> GetSupplier(Guid id, CancellationToken ct)
-    {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("SELECT id,name,contact_email,contact_phone,address FROM procurement.supplier WHERE id=@id", connection);
-        command.Parameters.AddWithValue("id", id);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? ReadSupplier(reader) : null;
-    }
+public sealed class ProcurementRepository(BusinessDbContext db)
+{
+    public async Task<IReadOnlyList<SupplierView>> ListSuppliers(CancellationToken ct) =>
+        await db.Suppliers.AsNoTracking().OrderBy(x => x.Name)
+            .Select(x => new SupplierView(x.Id, x.Name, x.ContactEmail, x.ContactPhone, x.Address)).ToListAsync(ct);
+    public async Task<SupplierView?> GetSupplier(Guid id, CancellationToken ct) =>
+        await db.Suppliers.AsNoTracking().Where(x => x.Id == id)
+            .Select(x => new SupplierView(x.Id, x.Name, x.ContactEmail, x.ContactPhone, x.Address)).SingleOrDefaultAsync(ct);
 
     public async Task<Guid> CreateSupplier(SupplierRequest request, CancellationToken ct)
     {
-        ValidateSupplier(request);
-        var id = Guid.NewGuid();
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("""
-            INSERT INTO procurement.supplier(id,name,contact_email,contact_phone,address)
-            VALUES(@id,@name,@email,@phone,@address)
-            """, connection);
-        AddSupplierParameters(command, id, request);
-        await command.ExecuteNonQueryAsync(ct);
-        return id;
+        ValidateSupplier(request); var id = Guid.NewGuid();
+        db.Suppliers.Add(new SupplierEntity { Id = id, Name = request.Name.Trim(), ContactEmail = request.ContactEmail, ContactPhone = request.Phone, Address = request.Address });
+        await db.SaveChangesAsync(ct); return id;
     }
-
     public async Task<bool> UpdateSupplier(Guid id, SupplierRequest request, CancellationToken ct)
     {
-        ValidateSupplier(request);
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("""
-            UPDATE procurement.supplier SET name=@name,contact_email=@email,contact_phone=@phone,address=@address WHERE id=@id
-            """, connection);
-        AddSupplierParameters(command, id, request);
-        return await command.ExecuteNonQueryAsync(ct) != 0;
+        ValidateSupplier(request); var s = await db.Suppliers.FindAsync([id], ct); if (s is null) return false;
+        s.Name = request.Name.Trim(); s.ContactEmail = request.ContactEmail; s.ContactPhone = request.Phone; s.Address = request.Address;
+        await db.SaveChangesAsync(ct); return true;
     }
-
     public async Task<bool> DeleteSupplier(Guid id, CancellationToken ct)
     {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("DELETE FROM procurement.supplier WHERE id=@id", connection);
-        command.Parameters.AddWithValue("id", id);
-        return await command.ExecuteNonQueryAsync(ct) != 0;
+        var s = await db.Suppliers.FindAsync([id], ct); if (s is null) return false;
+        db.Suppliers.Remove(s); await db.SaveChangesAsync(ct); return true;
     }
 
     public async Task<Guid> CreateOrder(CreateOrderRequest request, CancellationToken ct)
     {
-        if (request.SupplierId == Guid.Empty) throw new ArgumentException("Supplier ID is required.");
+        if (request.SupplierId == Guid.Empty || !await db.Suppliers.AnyAsync(x => x.Id == request.SupplierId, ct)) throw new ArgumentException("Supplier not found.");
         if (request.Lines is null || request.Lines.Count == 0) throw new ArgumentException("At least one order line is required.");
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var supplier = new SqlCommand("SELECT EXISTS(SELECT 1 FROM procurement.supplier WHERE id=@id)", connection, transaction))
-        {
-            supplier.Parameters.AddWithValue("id", request.SupplierId);
-            if (!(bool)(await supplier.ExecuteScalarAsync(ct) ?? false)) throw new ArgumentException("Supplier not found.");
-        }
-
-        var orderId = Guid.NewGuid();
-        await using (var order = new SqlCommand("""
-            INSERT INTO procurement.purchase_order(id,supplier_id,status,placed_at) VALUES(@id,@supplier,'DRAFT',@now)
-            """, connection, transaction))
-        {
-            order.Parameters.AddWithValue("id", orderId);
-            order.Parameters.AddWithValue("supplier", request.SupplierId);
-            order.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-            await order.ExecuteNonQueryAsync(ct);
-        }
+        var order = new PurchaseOrderEntity { Id = Guid.NewGuid(), SupplierId = request.SupplierId, Status = "DRAFT", PlacedAt = DateTimeOffset.UtcNow };
         foreach (var line in request.Lines)
         {
-            ValidateQuantity(line.QuantityValue, line.UnitType);
-            if (line.UnitCost < 0) throw new ArgumentException("Unit cost cannot be negative.");
-            await using var product = new SqlCommand("SELECT unit_type FROM inventory.product WHERE id=@id", connection, transaction);
-            product.Parameters.AddWithValue("id", line.ProductId);
-            var productUnit = await product.ExecuteScalarAsync(ct) as string;
-            if (productUnit is null || !productUnit.Equals(line.UnitType, StringComparison.OrdinalIgnoreCase))
-                throw new ArgumentException($"Product or unit type is invalid: {line.ProductId}");
-            await using var insertLine = new SqlCommand("""
-                INSERT INTO procurement.purchase_order_line(id,purchase_order_id,product_id,value,unit_type,unit_cost)
-                VALUES(@id,@order,@product,@quantity,@unit,@cost)
-                """, connection, transaction);
-            insertLine.Parameters.AddWithValue("id", Guid.NewGuid());
-            insertLine.Parameters.AddWithValue("order", orderId);
-            insertLine.Parameters.AddWithValue("product", line.ProductId);
-            insertLine.Parameters.AddWithValue("quantity", line.QuantityValue);
-            insertLine.Parameters.AddWithValue("unit", line.UnitType.Equals("EACH", StringComparison.OrdinalIgnoreCase) ? (short)0 : (short)1);
-            insertLine.Parameters.AddWithValue("cost", line.UnitCost);
-            await insertLine.ExecuteNonQueryAsync(ct);
+            ValidateQuantity(line.QuantityValue, line.UnitType); if (line.UnitCost < 0) throw new ArgumentException("Unit cost cannot be negative.");
+            var product = await db.Products.AsNoTracking().SingleOrDefaultAsync(x => x.Id == line.ProductId, ct);
+            if (product is null || !product.UnitType.Equals(line.UnitType, StringComparison.OrdinalIgnoreCase)) throw new ArgumentException($"Product or unit type is invalid: {line.ProductId}");
+            order.Lines.Add(new PurchaseOrderLineEntity { Id = Guid.NewGuid(), ProductId = line.ProductId, Quantity = line.QuantityValue, UnitType = Unit(line.UnitType), UnitCost = line.UnitCost });
         }
-        await transaction.CommitAsync(ct);
-        return orderId;
+        db.PurchaseOrders.Add(order); await db.SaveChangesAsync(ct); return order.Id;
     }
-
     public async Task PlaceOrder(Guid id, CancellationToken ct)
     {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        string status;
-        await using (var order = new SqlCommand("SELECT status FROM procurement.purchase_order WHERE id=@id FOR UPDATE", connection, transaction))
-        {
-            order.Parameters.AddWithValue("id", id);
-            status = await order.ExecuteScalarAsync(ct) as string
-                ?? throw new ArgumentException($"Purchase order not found: {id}");
-        }
-        if (status != "DRAFT") throw new InvalidOperationException($"Purchase order {id}: expected DRAFT, current status {status}");
-        await using (var hasLines = new SqlCommand("SELECT EXISTS(SELECT 1 FROM procurement.purchase_order_line WHERE purchase_order_id=@id)", connection, transaction))
-        {
-            hasLines.Parameters.AddWithValue("id", id);
-            if (!(bool)(await hasLines.ExecuteScalarAsync(ct) ?? false))
-                throw new InvalidOperationException("Impossible d'envoyer une commande sans lignes");
-        }
-        await using var update = new SqlCommand("UPDATE procurement.purchase_order SET status='PLACED' WHERE id=@id", connection, transaction);
-        update.Parameters.AddWithValue("id", id);
-        await update.ExecuteNonQueryAsync(ct);
-        await transaction.CommitAsync(ct);
+        await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
+        var order = await db.PurchaseOrders.Include(x => x.Lines).SingleOrDefaultAsync(x => x.Id == id, ct) ?? throw new ArgumentException($"Purchase order not found: {id}");
+        if (order.Status != "DRAFT") throw new InvalidOperationException($"Purchase order {id}: expected DRAFT, current status {order.Status}");
+        if (order.Lines.Count == 0) throw new InvalidOperationException("Impossible d'envoyer une commande sans lignes");
+        order.Status = "PLACED"; await db.SaveChangesAsync(ct); await tx.CommitAsync(ct);
     }
-
     public async Task CancelOrder(Guid id, CancellationToken ct)
     {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        string status;
-        await using (var order = new SqlCommand("SELECT status FROM procurement.purchase_order WHERE id=@id FOR UPDATE", connection, transaction))
-        {
-            order.Parameters.AddWithValue("id", id);
-            status = await order.ExecuteScalarAsync(ct) as string
-                ?? throw new ArgumentException($"Purchase order not found: {id}");
-        }
-        if (status is not ("DRAFT" or "PLACED"))
-            throw new InvalidOperationException($"Commande {id} : seule une commande DRAFT ou PLACED peut Ãªtre annulÃ©e");
-        await using var update = new SqlCommand("UPDATE procurement.purchase_order SET status='CANCELLED' WHERE id=@id", connection, transaction);
-        update.Parameters.AddWithValue("id", id);
-        await update.ExecuteNonQueryAsync(ct);
-        await transaction.CommitAsync(ct);
+        await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
+        var order = await db.PurchaseOrders.SingleOrDefaultAsync(x => x.Id == id, ct) ?? throw new ArgumentException($"Purchase order not found: {id}");
+        if (order.Status is not ("DRAFT" or "PLACED")) throw new InvalidOperationException($"Commande {id} : seule une commande DRAFT ou PLACED peut être annulée");
+        order.Status = "CANCELLED"; await db.SaveChangesAsync(ct); await tx.CommitAsync(ct);
     }
 
     public async Task ReceiveOrder(Guid id, ReceiveOrderRequest request, CancellationToken ct)
     {
-        if (request.Lines is null || request.Lines.Count == 0)
-            throw new ArgumentException("A receipt must contain every order line.");
-        if (request.Lines.Select(x => x.PurchaseOrderLineId).Distinct().Count() != request.Lines.Count)
-            throw new ArgumentException("A receipt cannot contain duplicate order lines.");
-
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        string status;
-        Guid supplierId;
-        await using (var order = new SqlCommand("SELECT status,supplier_id FROM procurement.purchase_order WHERE id=@id FOR UPDATE", connection, transaction))
-        {
-            order.Parameters.AddWithValue("id", id);
-            await using var reader = await order.ExecuteReaderAsync(ct);
-            if (!await reader.ReadAsync(ct)) throw new ArgumentException($"Purchase order not found: {id}");
-            status = reader.GetString(0);
-            supplierId = reader.GetGuid(1);
-        }
-        if (status != "PLACED") throw new InvalidOperationException("Only a placed purchase order can be received.");
-
-        var orderLines = new Dictionary<Guid, (Guid ProductId, decimal Quantity, short UnitType, decimal UnitCost)>();
-        await using (var lines = new SqlCommand("""
-            SELECT id,product_id,value,unit_type,unit_cost FROM procurement.purchase_order_line
-            WHERE purchase_order_id=@id
-            """, connection, transaction))
-        {
-            lines.Parameters.AddWithValue("id", id);
-            await using var reader = await lines.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-                orderLines.Add(reader.GetGuid(0), (reader.GetGuid(1), reader.GetDecimal(2), reader.GetInt16(3), reader.GetDecimal(4)));
-        }
-        if (orderLines.Count != request.Lines.Count || request.Lines.Any(line => !orderLines.ContainsKey(line.PurchaseOrderLineId)))
+        if (request.Lines is null || request.Lines.Count == 0 || request.Lines.Select(x => x.PurchaseOrderLineId).Distinct().Count() != request.Lines.Count)
+            throw new ArgumentException("A receipt must contain every order line exactly once.");
+        await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
+        var order = await db.PurchaseOrders.Include(x => x.Lines).SingleOrDefaultAsync(x => x.Id == id, ct) ?? throw new ArgumentException($"Purchase order not found: {id}");
+        if (order.Status != "PLACED") throw new InvalidOperationException("Only a placed purchase order can be received.");
+        if (order.Lines.Count != request.Lines.Count || request.Lines.Any(x => !order.Lines.Any(l => l.Id == x.PurchaseOrderLineId)))
             throw new ArgumentException("A receipt must include every order line exactly once.");
-
         foreach (var receipt in request.Lines)
         {
-            ValidateQuantity(receipt.QuantityValue, receipt.UnitType);
-            var ordered = orderLines[receipt.PurchaseOrderLineId];
-            var receiptUnit = receipt.UnitType.Equals("EACH", StringComparison.OrdinalIgnoreCase) ? (short)0 : (short)1;
-            if (receiptUnit != ordered.UnitType || receipt.QuantityValue != ordered.Quantity)
-                throw new ArgumentException("Received quantity and unit must match the purchase order.");
-
-            bool perishable;
-            await using (var product = new SqlCommand("SELECT perishable FROM inventory.product WHERE id=@id", connection, transaction))
-            {
-                product.Parameters.AddWithValue("id", ordered.ProductId);
-                var value = await product.ExecuteScalarAsync(ct);
-                if (value is null) throw new ArgumentException($"Product not found: {ordered.ProductId}");
-                perishable = (bool)value;
-            }
-            if (perishable && receipt.ExpiryDate is null)
-                throw new ArgumentException("Perishable products require an expiry date.");
-
-            var stockLevelId = Guid.NewGuid();
-            await using (var stock = new SqlCommand("""
-                INSERT INTO inventory.stock_level(id,product_id,version) VALUES(@id,@product,0)
-                ON CONFLICT(product_id) DO UPDATE SET version=inventory.stock_level.version+1 RETURNING id
-                """, connection, transaction))
-            {
-                stock.Parameters.AddWithValue("id", stockLevelId);
-                stock.Parameters.AddWithValue("product", ordered.ProductId);
-                stockLevelId = (Guid)(await stock.ExecuteScalarAsync(ct))!;
-            }
-            var lotId = Guid.NewGuid();
-            var lotNumber = string.IsNullOrWhiteSpace(receipt.LotNumber)
-                ? $"LOT-{Guid.NewGuid().ToString("N")[..8].ToUpperInvariant()}"
-                : receipt.LotNumber.Trim();
-            await using (var lot = new SqlCommand("""
-                INSERT INTO inventory.lot(id,lot_number,product_id,expiry_date,received_date,supplier_reference,unit_cost)
-                VALUES(@id,@number,@product,@expiry,@received,@reference,@cost)
-                """, connection, transaction))
-            {
-                lot.Parameters.AddWithValue("id", lotId);
-                lot.Parameters.AddWithValue("number", lotNumber);
-                lot.Parameters.AddWithValue("product", ordered.ProductId);
-                lot.Parameters.AddWithValue("expiry", (object?)receipt.ExpiryDate ?? DBNull.Value);
-                lot.Parameters.AddWithValue("received", (object?)receipt.ReceivedDate ?? DateOnly.FromDateTime(DateTime.Today));
-                lot.Parameters.AddWithValue("reference", (object?)receipt.SupplierReference ?? DBNull.Value);
-                lot.Parameters.AddWithValue("cost", ordered.UnitCost);
-                await lot.ExecuteNonQueryAsync(ct);
-            }
-            await using (var entry = new SqlCommand("""
-                INSERT INTO inventory.lot_entry
-                    (id,stock_level_id,lot_id,on_hand_value,on_hand_unit_type,reserved_value,reserved_unit_type)
-                VALUES(@id,@stock,@lot,@quantity,@unit,0,@unit)
-                """, connection, transaction))
-            {
-                entry.Parameters.AddWithValue("id", Guid.NewGuid());
-                entry.Parameters.AddWithValue("stock", stockLevelId);
-                entry.Parameters.AddWithValue("lot", lotId);
-                entry.Parameters.AddWithValue("quantity", receipt.QuantityValue);
-                entry.Parameters.AddWithValue("unit", receiptUnit);
-                await entry.ExecuteNonQueryAsync(ct);
-            }
+            ValidateQuantity(receipt.QuantityValue, receipt.UnitType); var line = order.Lines.Single(x => x.Id == receipt.PurchaseOrderLineId);
+            if (line.UnitType != Unit(receipt.UnitType) || line.Quantity != receipt.QuantityValue) throw new ArgumentException("Received quantity and unit must match the purchase order.");
+            var product = await db.Products.SingleAsync(x => x.Id == line.ProductId, ct);
+            if (product.Perishable && receipt.ExpiryDate is null) throw new ArgumentException("Perishable products require an expiry date.");
+            var stock = await db.StockLevels.SingleOrDefaultAsync(x => x.ProductId == line.ProductId, ct);
+            if (stock is null) { stock = new StockLevelEntity { Id = Guid.NewGuid(), ProductId = line.ProductId, Version = 0 }; db.StockLevels.Add(stock); }
+            else stock.Version++;
+            var lot = new LotEntity { Id = Guid.NewGuid(), LotNumber = string.IsNullOrWhiteSpace(receipt.LotNumber) ? $"LOT-{Guid.NewGuid():N}"[..12].ToUpperInvariant() : receipt.LotNumber.Trim(), ProductId = line.ProductId, ExpiryDate = receipt.ExpiryDate, ReceivedDate = receipt.ReceivedDate ?? DateOnly.FromDateTime(DateTime.Today), SupplierReference = receipt.SupplierReference, UnitCost = line.UnitCost };
+            db.Lots.Add(lot); db.LotEntries.Add(new LotEntryEntity { Id = Guid.NewGuid(), StockLevelId = stock.Id, LotId = lot.Id, OnHandValue = receipt.QuantityValue, OnHandUnitType = line.UnitType, ReservedValue = 0, ReservedUnitType = line.UnitType });
         }
-
-        await using (var received = new SqlCommand(
-            "UPDATE procurement.purchase_order SET status='RECEIVED' WHERE id=@id AND status='PLACED'", connection, transaction))
-        {
-            received.Parameters.AddWithValue("id", id);
-            if (await received.ExecuteNonQueryAsync(ct) != 1)
-                throw new InvalidOperationException("Purchase order status changed before receipt could be committed.");
-        }
-        var totalCost = orderLines.Values.Sum(line => line.Quantity * line.UnitCost);
-        await OutboxWriter.Write(connection, transaction, "GoodsReceived",
-            new GoodsReceivedEvent(id, supplierId, totalCost), ct);
-        await transaction.CommitAsync(ct);
+        order.Status = "RECEIVED"; db.DotnetOutbox.Add(new DotnetOutboxEntity { Id = Guid.NewGuid(), EventType = "GoodsReceived", Payload = JsonSerializer.Serialize(new GoodsReceivedEvent(id, order.SupplierId, order.Lines.Sum(x => x.Quantity * x.UnitCost))), OccurredAt = DateTimeOffset.UtcNow });
+        await db.SaveChangesAsync(ct); await tx.CommitAsync(ct);
     }
 
-    public async Task<OrderView?> GetOrder(Guid id, CancellationToken ct)
-    {
-        var orders = await ReadOrders(id, ct);
-        return orders.FirstOrDefault();
-    }
-
+    public async Task<OrderView?> GetOrder(Guid id, CancellationToken ct) => (await ReadOrders(id, ct)).FirstOrDefault();
     public Task<IReadOnlyList<OrderView>> ListOrders(CancellationToken ct) => ReadOrders(null, ct);
-
     private async Task<IReadOnlyList<OrderView>> ReadOrders(Guid? id, CancellationToken ct)
     {
-        const string sql = """
-            SELECT po.id,po.supplier_id,s.name,po.status,po.placed_at,
-                   pol.id,pol.product_id,pol.value,pol.unit_type,pol.unit_cost
-            FROM procurement.purchase_order po
-            LEFT JOIN procurement.supplier s ON s.id=po.supplier_id
-            LEFT JOIN procurement.purchase_order_line pol ON pol.purchase_order_id=po.id
-            WHERE (@id IS NULL OR po.id=@id)
-            ORDER BY po.placed_at DESC, pol.id
-            """;
-        var builders = new Dictionary<Guid, OrderBuilder>();
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand(sql, connection);
-        command.Parameters.AddWithValue("id", (object?)id ?? DBNull.Value);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            var orderId = reader.GetGuid(0);
-            if (!builders.TryGetValue(orderId, out var builder))
-            {
-                builder = new OrderBuilder(orderId, reader.GetGuid(1), reader.IsDBNull(2) ? null : reader.GetString(2),
-                    reader.GetString(3), new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(4), DateTimeKind.Utc)));
-                builders.Add(orderId, builder);
-            }
-            if (!reader.IsDBNull(5))
-            {
-                var quantity = reader.GetDecimal(7);
-                var cost = reader.GetDecimal(9);
-                builder.Lines.Add(new OrderLineView(reader.GetGuid(5), reader.GetGuid(6), quantity.ToString(),
-                    reader.GetInt16(8) == 0 ? "EACH" : "WEIGHT", cost.ToString()));
-                builder.Total += quantity * cost;
-            }
-        }
-        return builders.Values.Select(x => x.ToView()).ToArray();
+        var orders = await db.PurchaseOrders.AsNoTracking().Include(x => x.Lines).Where(x => id == null || x.Id == id).OrderByDescending(x => x.PlacedAt).ToListAsync(ct);
+        var suppliers = await db.Suppliers.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Name, ct);
+        return orders.Select(o => new OrderView(o.Id, o.SupplierId, suppliers.GetValueOrDefault(o.SupplierId), o.Status,
+            o.Lines.OrderBy(x => x.Id).Select(x => new OrderLineView(x.Id, x.ProductId, x.Quantity.ToString(), x.UnitType == 0 ? "EACH" : "WEIGHT", x.UnitCost.ToString())).ToArray(),
+            o.Lines.Sum(x => x.Quantity * x.UnitCost).ToString(), null, JavaInstantFormat.Format(o.PlacedAt), null)).ToArray();
     }
-
     public async Task<IReadOnlyList<AlertView>> ListAlerts(CancellationToken ct)
     {
-        const string sql = """
-            SELECT a.id,a.product_id,COALESCE(p.name,'Unknown product'),
-                   COALESCE(SUM(le.on_hand_value-le.reserved_value),0),COALESCE(p.reorder_point,0),a.raised_at,a.acknowledged
-            FROM procurement.low_stock_alert a
-            LEFT JOIN inventory.product p ON p.id=a.product_id
-            LEFT JOIN inventory.stock_level sl ON sl.product_id=a.product_id
-            LEFT JOIN inventory.lot_entry le ON le.stock_level_id=sl.id
-            GROUP BY a.id,a.product_id,p.name,p.reorder_point,a.raised_at,a.acknowledged
-            ORDER BY a.raised_at DESC
-            """;
-        var alerts = new List<AlertView>();
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand(sql, connection);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            var created = new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(5), DateTimeKind.Utc));
-            alerts.Add(new AlertView(reader.GetGuid(0), reader.GetGuid(1), reader.GetString(2),
-                (double)reader.GetDecimal(3), reader.GetInt32(4), JavaInstantFormat.Format(created), reader.GetBoolean(6)));
-        }
-        return alerts;
+        var alerts = await db.LowStockAlerts.AsNoTracking().OrderByDescending(x => x.RaisedAt).ToListAsync(ct);
+        var products = await db.Products.AsNoTracking().ToDictionaryAsync(x => x.Id, ct);
+        var stocks = await db.StockLevels.AsNoTracking().ToDictionaryAsync(x => x.ProductId, ct);
+        var entries = await db.LotEntries.AsNoTracking().ToListAsync(ct);
+        return alerts.Select(a => { products.TryGetValue(a.ProductId, out var p); stocks.TryGetValue(a.ProductId, out var s); var current = entries.Where(e => e.StockLevelId == s?.Id).Sum(e => (e.OnHandValue ?? 0) - (e.ReservedValue ?? 0)); return new AlertView(a.Id, a.ProductId, p?.Name ?? "Unknown product", (double)current, p?.ReorderPoint ?? 0, JavaInstantFormat.Format(a.RaisedAt), a.Acknowledged); }).ToArray();
     }
+    public async Task AcknowledgeAlert(Guid id, CancellationToken ct) { var a = await db.LowStockAlerts.FindAsync([id], ct) ?? throw new ArgumentException($"Alert not found: {id}"); a.Acknowledged = true; await db.SaveChangesAsync(ct); }
 
-    public async Task AcknowledgeAlert(Guid id, CancellationToken ct)
-    {
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("UPDATE procurement.low_stock_alert SET acknowledged=1 WHERE id=@id", connection);
-        command.Parameters.AddWithValue("id", id);
-        if (await command.ExecuteNonQueryAsync(ct) == 0) throw new ArgumentException($"Alert not found: {id}");
-    }
-
-    private static SupplierView ReadSupplier(SqlDataReader reader) => new(reader.GetGuid(0), reader.GetString(1),
-        reader.IsDBNull(2) ? null : reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3),
-        reader.IsDBNull(4) ? null : reader.GetString(4));
-
-    private static void AddSupplierParameters(SqlCommand command, Guid id, SupplierRequest request)
-    {
-        command.Parameters.AddWithValue("id", id);
-        command.Parameters.AddWithValue("name", request.Name.Trim());
-        command.Parameters.AddWithValue("email", (object?)request.ContactEmail ?? DBNull.Value);
-        command.Parameters.AddWithValue("phone", (object?)request.Phone ?? DBNull.Value);
-        command.Parameters.AddWithValue("address", (object?)request.Address ?? DBNull.Value);
-    }
-
-    private static void ValidateSupplier(SupplierRequest request)
-    {
-        if (string.IsNullOrWhiteSpace(request.Name)) throw new ArgumentException("Supplier name is required.");
-        if (request.Name.Trim().Length > 255) throw new ArgumentException("Supplier name is too long.");
-        if (request.Address?.Length > 500) throw new ArgumentException("Address cannot exceed 500 characters.");
-    }
-
-    private static void ValidateQuantity(decimal value, string unitType)
-    {
-        if (value <= 0) throw new ArgumentException("Quantity must be positive.");
-        if (!unitType.Equals("EACH", StringComparison.OrdinalIgnoreCase)
-            && !unitType.Equals("WEIGHT", StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("Unit type must be EACH or WEIGHT.");
-        if (unitType.Equals("EACH", StringComparison.OrdinalIgnoreCase) && value != decimal.Truncate(value))
-            throw new ArgumentException("EACH quantity must be a whole number.");
-        if (unitType.Equals("WEIGHT", StringComparison.OrdinalIgnoreCase) && decimal.Round(value, 3) != value)
-            throw new ArgumentException("WEIGHT quantities support at most three decimal places.");
-    }
-
-    private sealed class OrderBuilder(Guid id, Guid supplierId, string? supplierName, string status, DateTimeOffset placedAt)
-    {
-        public List<OrderLineView> Lines { get; } = [];
-        public decimal Total { get; set; }
-        public OrderView ToView() => new(id, supplierId, supplierName, status, Lines,
-            Total.ToString(System.Globalization.CultureInfo.InvariantCulture), null,
-            JavaInstantFormat.Format(placedAt), null);
-    }
+    private static short Unit(string unit) => unit.Equals("EACH", StringComparison.OrdinalIgnoreCase) ? (short)0 : (short)1;
+    private static void ValidateSupplier(SupplierRequest r) { if (string.IsNullOrWhiteSpace(r.Name)) throw new ArgumentException("Supplier name is required."); if (r.Name.Trim().Length > 255) throw new ArgumentException("Supplier name is too long."); if (r.Address?.Length > 500) throw new ArgumentException("Address cannot exceed 500 characters."); }
+    private static void ValidateQuantity(decimal value, string unit) { if (value <= 0) throw new ArgumentException("Quantity must be positive."); if (unit is not ("EACH" or "each" or "WEIGHT" or "weight")) throw new ArgumentException("Unit type must be EACH or WEIGHT."); if (unit.Equals("EACH", StringComparison.OrdinalIgnoreCase) && value != decimal.Truncate(value)) throw new ArgumentException("EACH quantity must be a whole number."); if (unit.Equals("WEIGHT", StringComparison.OrdinalIgnoreCase) && decimal.Round(value, 3) != value) throw new ArgumentException("WEIGHT quantities support at most three decimal places."); }
 }
-
