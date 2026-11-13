@@ -24,3 +24,22 @@ internal sealed record UserRecord(
 }
 
 public sealed class InvalidCredentialsException : Exception { }
+
+internal sealed class AuthUser
+{
+    public Guid Id { get; set; }
+    public string Username { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public string PasswordHash { get; set; } = "";
+    public bool Enabled { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public long Version { get; set; }
+    public List<AuthUserRole> Roles { get; set; } = [];
+}
+
+internal sealed class AuthUserRole
+{
+    public Guid UserId { get; set; }
+    public string Role { get; set; } = "";
+    public AuthUser User { get; set; } = null!;
+}

@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using SupermarketErp.Api.Features.Auth;
 using SupermarketErp.Api.Features.Ecommerce;
@@ -29,6 +30,8 @@ public static class ServiceCollectionExtensions
         });
 
         services.AddSingleton(new SqlServerDataSource(DatabaseConnectionString.Create(configuration)));
+        services.AddDbContext<AuthDbContext>((serviceProvider, options) =>
+            options.UseSqlServer(serviceProvider.GetRequiredService<SqlServerDataSource>().ConnectionString));
         services.AddScoped<AuthService>();
         services.AddScoped<ProductRepository>();
         services.AddScoped<InventoryRepository>();
