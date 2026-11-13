@@ -1,14 +1,14 @@
-using Microsoft.Data.SqlClient;
+﻿using Microsoft.Data.SqlClient;
 
 namespace SupermarketErp.Api.Infrastructure;
 
 public static class IdentityDatabaseInitializer
 {
     // Creates the .NET-owned tables without requiring a separate migration runner.
-    public static async Task EnsureCreated(NpgsqlDataSource dataSource, CancellationToken ct = default)
+    public static async Task EnsureCreated(SqlServerDataSource dataSource, CancellationToken ct = default)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             IF SCHEMA_ID(N'platform') IS NULL EXEC(N'CREATE SCHEMA [platform]');
 
             IF OBJECT_ID(N'[dbo].[app_user]', N'U') IS NULL
@@ -55,3 +55,4 @@ public static class IdentityDatabaseInitializer
         await command.ExecuteNonQueryAsync(ct);
     }
 }
+

@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using Microsoft.Data.SqlClient;
 using SupermarketErp.Api.Features.Auth;
 using SupermarketErp.Api.Infrastructure;
@@ -46,7 +46,7 @@ public static class FinanceEndpoints
     }
 }
 
-public sealed class FinanceRepository(NpgsqlDataSource dataSource)
+public sealed class FinanceRepository(SqlServerDataSource dataSource)
 {
     public async Task<IReadOnlyList<LedgerEntryView>> ListLedger(CancellationToken ct)
     {
@@ -60,7 +60,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
             """;
         var entries = new List<LedgerEntryView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(sql, connection);
+        await using var command = new SqlCommand(sql, connection);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) entries.Add(new LedgerEntryView(reader.GetGuid(0), reader.GetString(1),
             FormatMoney(reader.GetDecimal(2)), reader.GetString(3), reader.IsDBNull(4) ? null : reader.GetGuid(4), Instant(reader, 5)));
@@ -77,7 +77,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
             """;
         var entries = new Dictionary<Guid, JournalBuilder>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(sql, connection);
+        await using var command = new SqlCommand(sql, connection);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
@@ -110,7 +110,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
             """;
         var balances = new Dictionary<string, decimal>(StringComparer.Ordinal);
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(sql, connection);
+        await using var command = new SqlCommand(sql, connection);
         command.Parameters.AddWithValue("from", start.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc));
         command.Parameters.AddWithValue("until", end.AddDays(1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc));
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -128,7 +128,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
     {
         var list = new List<InvoiceView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(InvoiceSelect + " ORDER BY created_at DESC", connection);
+        await using var command = new SqlCommand(InvoiceSelect + " ORDER BY created_at DESC", connection);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) list.Add(ReadInvoice(reader));
         return list;
@@ -143,8 +143,8 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
         var id = Guid.NewGuid();
         var issueDate = request.IssueDate ?? DateOnly.FromDateTime(DateTime.Today);
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var insert = new NpgsqlCommand("""
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using (var insert = new SqlCommand("""
             INSERT INTO finance.supplier_invoice(id,supplier_id,purchase_order_id,invoice_number,subtotal,tax_amount,total_amount,paid_amount,status,issue_date,due_date,created_at,version)
             VALUES(@id,@supplier,@po,@number,@subtotal,@tax,@total,0,'OPEN',@issue,@due,@now,0)
             """, connection, transaction))
@@ -180,8 +180,8 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
         if (request.Amount <= 0) throw new ArgumentException("Payment amount must be positive.");
         if (string.IsNullOrWhiteSpace(request.PaymentMethod)) throw new ArgumentException("Payment method is required.");
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var duplicate = new NpgsqlCommand("SELECT invoice_id FROM finance.supplier_payment WHERE payment_reference=@reference", connection, transaction))
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using (var duplicate = new SqlCommand("SELECT invoice_id FROM finance.supplier_payment WHERE payment_reference=@reference", connection, transaction))
         {
             duplicate.Parameters.AddWithValue("reference", request.PaymentReference.Trim());
             var existing = await duplicate.ExecuteScalarAsync(ct);
@@ -200,7 +200,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
         var paid = invoice.Paid + amount;
         var status = paid == invoice.Total ? "PAID" : "PARTIALLY_PAID";
         var method = request.PaymentMethod.Trim().ToUpperInvariant();
-        await using (var payment = new NpgsqlCommand("INSERT INTO finance.supplier_payment(id,payment_reference,invoice_id,amount,payment_method,paid_date) VALUES(@id,@reference,@invoice,@amount,@method,@date)", connection, transaction))
+        await using (var payment = new SqlCommand("INSERT INTO finance.supplier_payment(id,payment_reference,invoice_id,amount,payment_method,paid_date) VALUES(@id,@reference,@invoice,@amount,@method,@date)", connection, transaction))
         {
             payment.Parameters.AddWithValue("id", Guid.NewGuid());
             payment.Parameters.AddWithValue("reference", request.PaymentReference.Trim());
@@ -210,7 +210,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
             payment.Parameters.AddWithValue("date", request.PaidDate ?? DateOnly.FromDateTime(DateTime.Today));
             await payment.ExecuteNonQueryAsync(ct);
         }
-        await using (var update = new NpgsqlCommand("UPDATE finance.supplier_invoice SET paid_amount=@paid,status=@status,version=version+1 WHERE id=@id", connection, transaction))
+        await using (var update = new SqlCommand("UPDATE finance.supplier_invoice SET paid_amount=@paid,status=@status,version=version+1 WHERE id=@id", connection, transaction))
         {
             update.Parameters.AddWithValue("paid", paid);
             update.Parameters.AddWithValue("status", status);
@@ -231,7 +231,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
         if (request.Amount <= 0) throw new ArgumentException("Settlement amount must be positive.");
         var amount = Money(request.Amount);
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         await PostJournal(connection, transaction, $"card-settlement:{request.SettlementReference.Trim()}",
             $"Card settlement {request.SettlementReference.Trim()}", null,
             [new("BANK", amount, 0, "Card settlement received"), new("CARD_CLEARING", 0, amount, "Clear card receivable")], ct);
@@ -246,24 +246,24 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
     private async Task<InvoiceView?> GetInvoice(Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(InvoiceSelect + " WHERE id=@id", connection);
+        await using var command = new SqlCommand(InvoiceSelect + " WHERE id=@id", connection);
         command.Parameters.AddWithValue("id", id);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadInvoice(reader) : null;
     }
 
-    private static async Task<InvoiceRecord?> ReadInvoiceForUpdate(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid id, CancellationToken ct)
+    private static async Task<InvoiceRecord?> ReadInvoiceForUpdate(SqlConnection connection, SqlTransaction transaction, Guid id, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand(InvoiceSelect + " WHERE id=@id FOR UPDATE", connection, transaction);
+        await using var command = new SqlCommand(InvoiceSelect + " WHERE id=@id FOR UPDATE", connection, transaction);
         command.Parameters.AddWithValue("id", id);
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) return null;
         return ReadInvoiceRecord(reader);
     }
 
-    private static InvoiceView ReadInvoice(NpgsqlDataReader reader) => ReadInvoiceRecord(reader).ToView();
+    private static InvoiceView ReadInvoice(SqlDataReader reader) => ReadInvoiceRecord(reader).ToView();
 
-    private static InvoiceRecord ReadInvoiceRecord(NpgsqlDataReader r) => new(r.GetGuid(0), r.GetGuid(1),
+    private static InvoiceRecord ReadInvoiceRecord(SqlDataReader r) => new(r.GetGuid(0), r.GetGuid(1),
         r.IsDBNull(2) ? null : r.GetGuid(2), r.GetString(3), r.GetDecimal(4), r.GetDecimal(5),
         r.GetDecimal(6), r.GetDecimal(7), r.GetString(8), r.GetFieldValue<DateOnly>(9), r.IsDBNull(10) ? null : r.GetFieldValue<DateOnly>(10));
 
@@ -279,7 +279,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
 
     private static decimal Money(decimal value) => decimal.Round(value, 3, MidpointRounding.AwayFromZero);
     private static string FormatMoney(decimal value) => $"{value.ToString("0.000", CultureInfo.InvariantCulture)} TND";
-    private static string Instant(NpgsqlDataReader r, int i) => JavaInstantFormat.Format(new DateTimeOffset(DateTime.SpecifyKind(r.GetDateTime(i), DateTimeKind.Utc)));
+    private static string Instant(SqlDataReader r, int i) => JavaInstantFormat.Format(new DateTimeOffset(DateTime.SpecifyKind(r.GetDateTime(i), DateTimeKind.Utc)));
 
     private sealed record JournalLineInput(string Account, decimal Debit, decimal Credit, string Description);
     private sealed class JournalBuilder(Guid id, string key, string description, Guid? reference, string postedAt)
@@ -297,13 +297,13 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
         public InvoiceView WithPayment(decimal paid, string status) => (this with { Paid = paid, Status = status }).ToView();
     }
 
-    private static async Task PostJournal(NpgsqlConnection c, NpgsqlTransaction tx, string key, string description,
+    private static async Task PostJournal(SqlConnection c, SqlTransaction tx, string key, string description,
         Guid? reference, IReadOnlyList<JournalLineInput> lines, CancellationToken ct)
     {
         if (lines.Sum(line => line.Debit) != lines.Sum(line => line.Credit))
             throw new InvalidOperationException($"Journal entry {key} is unbalanced.");
         var id = Guid.NewGuid();
-        await using (var entry = new NpgsqlCommand("""
+        await using (var entry = new SqlCommand("""
             INSERT INTO finance.journal_entry(id,event_key,description,reference_id,posted_at)
             VALUES(@id,@key,@description,@reference,@now) ON CONFLICT(event_key) DO NOTHING RETURNING id
             """, c, tx))
@@ -319,7 +319,7 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
         }
         foreach (var line in lines)
         {
-            await using var insert = new NpgsqlCommand("INSERT INTO finance.journal_line(id,journal_entry_id,account_code,debit_amount,credit_amount,description) VALUES(@id,@entry,@account,@debit,@credit,@description)", c, tx);
+            await using var insert = new SqlCommand("INSERT INTO finance.journal_line(id,journal_entry_id,account_code,debit_amount,credit_amount,description) VALUES(@id,@entry,@account,@debit,@credit,@description)", c, tx);
             insert.Parameters.AddWithValue("id", Guid.NewGuid());
             insert.Parameters.AddWithValue("entry", id);
             insert.Parameters.AddWithValue("account", line.Account);
@@ -330,3 +330,4 @@ public sealed class FinanceRepository(NpgsqlDataSource dataSource)
         }
     }
 }
+

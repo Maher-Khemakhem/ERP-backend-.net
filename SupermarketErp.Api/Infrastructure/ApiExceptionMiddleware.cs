@@ -1,10 +1,14 @@
 using Microsoft.Data.SqlClient;
+using Microsoft.AspNetCore.Mvc;
 using SupermarketErp.Api.Features.Auth;
 using SupermarketErp.Api.Features.Ecommerce;
 
 namespace SupermarketErp.Api.Infrastructure;
 
-public sealed class ApiExceptionMiddleware(RequestDelegate next, ILogger<ApiExceptionMiddleware> logger)
+public sealed class ApiExceptionMiddleware(
+    RequestDelegate next,
+    ILogger<ApiExceptionMiddleware> logger,
+    IProblemDetailsService problemDetailsService)
 {
     public async Task Invoke(HttpContext context)
     {
@@ -37,6 +41,10 @@ public sealed class ApiExceptionMiddleware(RequestDelegate next, ILogger<ApiExce
         {
             await WriteError(context, StatusCodes.Status409Conflict, "The requested change conflicts with existing data.");
         }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            return;
+        }
         catch (Exception ex)
         {
             logger.LogError(ex, "Unhandled API exception for {Method} {Path}", context.Request.Method, context.Request.Path);
@@ -44,15 +52,13 @@ public sealed class ApiExceptionMiddleware(RequestDelegate next, ILogger<ApiExce
         }
     }
 
-    private static async Task WriteError(HttpContext context, int status, string message)
+    private async Task WriteError(HttpContext context, int status, string message)
     {
         if (context.Response.HasStarted)
         {
             return;
         }
 
-        context.Response.Clear();
-        context.Response.StatusCode = status;
         var reason = status switch
         {
             StatusCodes.Status400BadRequest => "Bad Request",
@@ -62,12 +68,23 @@ public sealed class ApiExceptionMiddleware(RequestDelegate next, ILogger<ApiExce
             StatusCodes.Status503ServiceUnavailable => "Service Unavailable",
             _ => "Internal Server Error"
         };
-        await context.Response.WriteAsJsonAsync(new
+        context.Response.Clear();
+        context.Response.StatusCode = status;
+        await problemDetailsService.WriteAsync(new ProblemDetailsContext
         {
-            timestamp = JavaInstantFormat.Format(DateTimeOffset.UtcNow),
-            status,
-            error = reason,
-            message
+            HttpContext = context,
+            ProblemDetails = new ProblemDetails
+            {
+                Status = status,
+                Title = reason,
+                Detail = message,
+                Instance = context.Request.Path,
+                Extensions =
+                {
+                    ["timestamp"] = JavaInstantFormat.Format(DateTimeOffset.UtcNow),
+                    ["message"] = message
+                }
+            }
         });
     }
 }

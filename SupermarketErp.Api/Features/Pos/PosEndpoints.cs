@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Security.Cryptography;
 using System.Collections.Concurrent;
 using Microsoft.Data.SqlClient;
@@ -107,13 +107,13 @@ public static class PosEndpoints
     }
 }
 
-public sealed class PosRepository(NpgsqlDataSource dataSource)
+public sealed class PosRepository(SqlServerDataSource dataSource)
 {
     public async Task<IReadOnlyList<TillView>> ListTills(CancellationToken ct)
     {
         var list = new List<TillView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             SELECT t.id,t.till_number,t.status,s.cashier_name,
                    CASE WHEN s.status='OPEN' THEN s.expected_cash ELSE COALESCE(s.counted_cash,0) END,
                    s.opened_at,s.closed_at
@@ -129,7 +129,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     public async Task<TillView?> GetTill(Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             SELECT t.id,t.till_number,t.status,s.cashier_name,
                    CASE WHEN s.status='OPEN' THEN s.expected_cash ELSE COALESCE(s.counted_cash,0) END,
                    s.opened_at,s.closed_at
@@ -147,7 +147,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         if (string.IsNullOrWhiteSpace(request.TillNumber)) throw new ArgumentException("Till number is required.");
         var id = Guid.NewGuid();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("INSERT INTO pos.till(id,till_number,status,version) VALUES(@id,@number,'CLOSED',0)", connection);
+        await using var command = new SqlCommand("INSERT INTO pos.till(id,till_number,status,version) VALUES(@id,@number,'CLOSED',0)", connection);
         command.Parameters.AddWithValue("id", id);
         command.Parameters.AddWithValue("number", request.TillNumber.Trim());
         await command.ExecuteNonQueryAsync(ct);
@@ -159,20 +159,20 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         if (string.IsNullOrWhiteSpace(request.CashierName)) throw new ArgumentException("Cashier name is required.");
         if (request.OpeningFloat < 0) throw new ArgumentException("Opening float cannot be negative.");
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var till = new NpgsqlCommand("SELECT status FROM pos.till WHERE id=@id FOR UPDATE", connection, transaction))
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using (var till = new SqlCommand("SELECT status FROM pos.till WHERE id=@id FOR UPDATE", connection, transaction))
         {
             till.Parameters.AddWithValue("id", request.TillId);
             if (await till.ExecuteScalarAsync(ct) is null) throw new ArgumentException($"Till not found: {request.TillId}");
         }
-        await using (var check = new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM pos.cash_session WHERE till_id=@id AND status='OPEN')", connection, transaction))
+        await using (var check = new SqlCommand("SELECT EXISTS(SELECT 1 FROM pos.cash_session WHERE till_id=@id AND status='OPEN')", connection, transaction))
         {
             check.Parameters.AddWithValue("id", request.TillId);
             if ((bool)(await check.ExecuteScalarAsync(ct) ?? false)) throw new InvalidOperationException("Till already has an open cash session.");
         }
         var id = Guid.NewGuid();
         var now = DateTimeOffset.UtcNow;
-        await using (var insert = new NpgsqlCommand("""
+        await using (var insert = new SqlCommand("""
             INSERT INTO pos.cash_session(id,till_id,cashier_name,opening_float,expected_cash,counted_cash,status,opened_at,closed_at,version)
             VALUES(@id,@till,@cashier,@float,@float,NULL,'OPEN',@now,NULL,0)
             """, connection, transaction))
@@ -184,7 +184,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
             insert.Parameters.AddWithValue("now", now);
             await insert.ExecuteNonQueryAsync(ct);
         }
-        await using (var update = new NpgsqlCommand("UPDATE pos.till SET status='OPEN',version=version+1 WHERE id=@id", connection, transaction))
+        await using (var update = new SqlCommand("UPDATE pos.till SET status='OPEN',version=version+1 WHERE id=@id", connection, transaction))
         {
             update.Parameters.AddWithValue("id", request.TillId);
             await update.ExecuteNonQueryAsync(ct);
@@ -196,7 +196,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     public async Task<SessionView> GetSession(Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT id,till_id,status,expected_cash FROM pos.cash_session WHERE id=@id", connection);
+        await using var command = new SqlCommand("SELECT id,till_id,status,expected_cash FROM pos.cash_session WHERE id=@id", connection);
         command.Parameters.AddWithValue("id", id);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadSession(reader) : throw new ArgumentException($"Cash session not found: {id}");
@@ -205,7 +205,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     public async Task<SessionView?> GetActiveSession(Guid tillId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT id,till_id,status,expected_cash FROM pos.cash_session WHERE till_id=@id AND status='OPEN' ORDER BY opened_at DESC LIMIT 1", connection);
+        await using var command = new SqlCommand("SELECT id,till_id,status,expected_cash FROM pos.cash_session WHERE till_id=@id AND status='OPEN' ORDER BY opened_at DESC LIMIT 1", connection);
         command.Parameters.AddWithValue("id", tillId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadSession(reader) : null;
@@ -215,10 +215,10 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     {
         if (request.CountedCash < 0) throw new ArgumentException("Counted cash cannot be negative.");
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         Guid tillId;
         decimal expectedCash;
-        await using (var session = new NpgsqlCommand("SELECT till_id,status FROM pos.cash_session WHERE id=@id FOR UPDATE", connection, transaction))
+        await using (var session = new SqlCommand("SELECT till_id,status FROM pos.cash_session WHERE id=@id FOR UPDATE", connection, transaction))
         {
             session.Parameters.AddWithValue("id", id);
             await using var reader = await session.ExecuteReaderAsync(ct);
@@ -227,18 +227,18 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
             if (status != "OPEN") throw new InvalidOperationException($"Cash session is not open: {id}");
             tillId = reader.GetGuid(0);
             await reader.CloseAsync();
-            await using var expected = new NpgsqlCommand("SELECT expected_cash FROM pos.cash_session WHERE id=@id", connection, transaction);
+            await using var expected = new SqlCommand("SELECT expected_cash FROM pos.cash_session WHERE id=@id", connection, transaction);
             expected.Parameters.AddWithValue("id", id);
             expectedCash = (decimal)(await expected.ExecuteScalarAsync(ct) ?? 0m);
         }
-        await using (var close = new NpgsqlCommand("UPDATE pos.cash_session SET counted_cash=@cash,status='CLOSED',closed_at=@now,version=version+1 WHERE id=@id", connection, transaction))
+        await using (var close = new SqlCommand("UPDATE pos.cash_session SET counted_cash=@cash,status='CLOSED',closed_at=@now,version=version+1 WHERE id=@id", connection, transaction))
         {
             close.Parameters.AddWithValue("cash", request.CountedCash);
             close.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
             close.Parameters.AddWithValue("id", id);
             await close.ExecuteNonQueryAsync(ct);
         }
-        await using (var updateTill = new NpgsqlCommand("UPDATE pos.till SET status='CLOSED',version=version+1 WHERE id=@id", connection, transaction))
+        await using (var updateTill = new SqlCommand("UPDATE pos.till SET status='CLOSED',version=version+1 WHERE id=@id", connection, transaction))
         {
             updateTill.Parameters.AddWithValue("id", tillId);
             await updateTill.ExecuteNonQueryAsync(ct);
@@ -253,13 +253,13 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     {
         var id = Guid.NewGuid();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var session = new NpgsqlCommand("SELECT status FROM pos.cash_session WHERE id=@id FOR UPDATE", connection, transaction))
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using (var session = new SqlCommand("SELECT status FROM pos.cash_session WHERE id=@id FOR UPDATE", connection, transaction))
         {
             session.Parameters.AddWithValue("id", request.CashSessionId);
             if (await session.ExecuteScalarAsync(ct) as string != "OPEN") throw new InvalidOperationException("Cash session is not open.");
         }
-        await using var insert = new NpgsqlCommand("INSERT INTO pos.pos_transaction(id,cash_session_id,status,payment_method,started_at,completed_at,version) VALUES(@id,@session,'IN_PROGRESS',NULL,@now,NULL,0)", connection, transaction);
+        await using var insert = new SqlCommand("INSERT INTO pos.pos_transaction(id,cash_session_id,status,payment_method,started_at,completed_at,version) VALUES(@id,@session,'IN_PROGRESS',NULL,@now,NULL,0)", connection, transaction);
         insert.Parameters.AddWithValue("id", id);
         insert.Parameters.AddWithValue("session", request.CashSessionId);
         insert.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
@@ -272,7 +272,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     {
         var ids = new List<Guid>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT id FROM pos.pos_transaction ORDER BY started_at DESC", connection);
+        await using var command = new SqlCommand("SELECT id FROM pos.pos_transaction ORDER BY started_at DESC", connection);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) ids.Add(reader.GetGuid(0));
         var list = new List<TransactionView>(ids.Count);
@@ -283,7 +283,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     public async Task<TransactionView> GetTransaction(Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var ticket = new NpgsqlCommand("SELECT id,cash_session_id,status,payment_method,started_at,completed_at FROM pos.pos_transaction WHERE id=@id", connection);
+        await using var ticket = new SqlCommand("SELECT id,cash_session_id,status,payment_method,started_at,completed_at FROM pos.pos_transaction WHERE id=@id", connection);
         ticket.Parameters.AddWithValue("id", id);
         await using var reader = await ticket.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) throw new ArgumentException($"Ticket not found: {id}");
@@ -308,9 +308,9 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
             ? decimal.Round(request.QuantityValue, 3, MidpointRounding.AwayFromZero)
             : request.QuantityValue;
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         Guid sessionId;
-        await using (var ticket = new NpgsqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id AND status='IN_PROGRESS' FOR UPDATE", connection, transaction))
+        await using (var ticket = new SqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id AND status='IN_PROGRESS' FOR UPDATE", connection, transaction))
         {
             ticket.Parameters.AddWithValue("id", transactionId);
             var value = await ticket.ExecuteScalarAsync(ct);
@@ -321,7 +321,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
 
         decimal vatRate;
         string productUnit;
-        await using (var product = new NpgsqlCommand("SELECT unit_type,vat_rate FROM inventory.product WHERE id=@id", connection, transaction))
+        await using (var product = new SqlCommand("SELECT unit_type,vat_rate FROM inventory.product WHERE id=@id", connection, transaction))
         {
             product.Parameters.AddWithValue("id", request.ProductId);
             await using var reader = await product.ExecuteReaderAsync(ct);
@@ -332,7 +332,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         if (!productUnit.Equals(unit, StringComparison.Ordinal)) throw new ArgumentException("Requested unit type does not match the product.");
 
         decimal unitPrice;
-        await using (var price = new NpgsqlCommand("SELECT unit_price FROM pricing.product_price WHERE product_id=@id", connection, transaction))
+        await using (var price = new SqlCommand("SELECT unit_price FROM pricing.product_price WHERE product_id=@id", connection, transaction))
         {
             price.Parameters.AddWithValue("id", request.ProductId);
             var result = await price.ExecuteScalarAsync(ct);
@@ -340,7 +340,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
             unitPrice = value;
         }
         decimal net = decimal.Round(unitPrice * quantityValue, 3, MidpointRounding.AwayFromZero);
-        await using (var promo = new NpgsqlCommand("""
+        await using (var promo = new SqlCommand("""
             SELECT discount_percent FROM pricing.promotion
             WHERE product_id=@id AND active=1 AND valid_from<=@now AND valid_until>=@now
             ORDER BY valid_from LIMIT 1
@@ -358,7 +358,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         var vat = decimal.Round(net * vatRate / 100m, 3, MidpointRounding.AwayFromZero);
         var gross = net + vat;
         var lineId = Guid.NewGuid();
-        await using (var insert = new NpgsqlCommand("""
+        await using (var insert = new SqlCommand("""
             INSERT INTO pos.transaction_line(id,transaction_id,product_id,value,unit_type,line_total,vat_amount)
             VALUES(@id,@transaction,@product,@quantity,@unit,@total,@vat)
             """, connection, transaction))
@@ -372,7 +372,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
             insert.Parameters.AddWithValue("vat", vat);
             await insert.ExecuteNonQueryAsync(ct);
         }
-        await using (var version = new NpgsqlCommand("UPDATE pos.pos_transaction SET version=version+1 WHERE id=@id", connection, transaction))
+        await using (var version = new SqlCommand("UPDATE pos.pos_transaction SET version=version+1 WHERE id=@id", connection, transaction))
         {
             version.Parameters.AddWithValue("id", transactionId);
             await version.ExecuteNonQueryAsync(ct);
@@ -384,15 +384,15 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     public async Task<bool> RemoveLine(Guid transactionId, Guid lineId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         await RequireInProgress(connection, transaction, transactionId, ct);
-        await using var delete = new NpgsqlCommand("DELETE FROM pos.transaction_line WHERE transaction_id=@transaction AND id=@line", connection, transaction);
+        await using var delete = new SqlCommand("DELETE FROM pos.transaction_line WHERE transaction_id=@transaction AND id=@line", connection, transaction);
         delete.Parameters.AddWithValue("transaction", transactionId);
         delete.Parameters.AddWithValue("line", lineId);
         var changed = await delete.ExecuteNonQueryAsync(ct) != 0;
         if (changed)
         {
-            await using var version = new NpgsqlCommand("UPDATE pos.pos_transaction SET version=version+1 WHERE id=@id", connection, transaction);
+            await using var version = new SqlCommand("UPDATE pos.pos_transaction SET version=version+1 WHERE id=@id", connection, transaction);
             version.Parameters.AddWithValue("id", transactionId);
             await version.ExecuteNonQueryAsync(ct);
         }
@@ -405,9 +405,9 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         var method = request.PaymentMethod.Trim().ToUpperInvariant();
         if (method is not ("CASH" or "CARD")) throw new ArgumentException("Payment method must be CASH or CARD.");
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         Guid sessionId;
-        await using (var ticket = new NpgsqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id AND status='IN_PROGRESS' FOR UPDATE", connection, transaction))
+        await using (var ticket = new SqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id AND status='IN_PROGRESS' FOR UPDATE", connection, transaction))
         {
             ticket.Parameters.AddWithValue("id", id);
             var value = await ticket.ExecuteScalarAsync(ct);
@@ -416,7 +416,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         }
         await RequireOpenSession(connection, transaction, sessionId, ct);
         decimal total;
-        await using (var amount = new NpgsqlCommand("SELECT COALESCE(SUM(line_total),0) FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
+        await using (var amount = new SqlCommand("SELECT COALESCE(SUM(line_total),0) FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
         {
             amount.Parameters.AddWithValue("id", id);
             total = (decimal)(await amount.ExecuteScalarAsync(ct) ?? 0m);
@@ -426,7 +426,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
             throw new ArgumentException(method == "CASH" ? "Cash received is less than the transaction total." : "Card amount must equal the transaction total.");
 
         var lines = new List<(Guid Product, decimal Quantity, short Unit)>();
-        await using (var query = new NpgsqlCommand("SELECT product_id,value,unit_type FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
+        await using (var query = new SqlCommand("SELECT product_id,value,unit_type FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
         {
             query.Parameters.AddWithValue("id", id);
             await using var reader = await query.ExecuteReaderAsync(ct);
@@ -436,7 +436,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         foreach (var line in lines) cogs += await SellFromStock(connection, transaction, line.Product, line.Quantity, line.Unit, ct);
         decimal netAmount;
         decimal vatAmount;
-        await using (var totals = new NpgsqlCommand("SELECT COALESCE(SUM(line_total-vat_amount),0),COALESCE(SUM(vat_amount),0) FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
+        await using (var totals = new SqlCommand("SELECT COALESCE(SUM(line_total-vat_amount),0),COALESCE(SUM(vat_amount),0) FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
         {
             totals.Parameters.AddWithValue("id", id);
             await using var reader = await totals.ExecuteReaderAsync(ct);
@@ -444,7 +444,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
             netAmount = reader.GetDecimal(0);
             vatAmount = reader.GetDecimal(1);
         }
-        await using (var complete = new NpgsqlCommand("UPDATE pos.pos_transaction SET status='COMPLETED',payment_method=@method,completed_at=@now,version=version+1 WHERE id=@id", connection, transaction))
+        await using (var complete = new SqlCommand("UPDATE pos.pos_transaction SET status='COMPLETED',payment_method=@method,completed_at=@now,version=version+1 WHERE id=@id", connection, transaction))
         {
             complete.Parameters.AddWithValue("method", method);
             complete.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
@@ -453,7 +453,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         }
         if (method == "CASH")
         {
-            await using var cash = new NpgsqlCommand("UPDATE pos.cash_session SET expected_cash=expected_cash+@total,version=version+1 WHERE id=@id", connection, transaction);
+            await using var cash = new SqlCommand("UPDATE pos.cash_session SET expected_cash=expected_cash+@total,version=version+1 WHERE id=@id", connection, transaction);
             cash.Parameters.AddWithValue("total", total);
             cash.Parameters.AddWithValue("id", sessionId);
             await cash.ExecuteNonQueryAsync(ct);
@@ -466,11 +466,11 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     public async Task<bool> Void(Guid id, VoidTransactionRequest request, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         await RequireInProgress(connection, transaction, id, ct);
         var session = await GetTransactionSession(connection, transaction, id, ct);
         await RequireOpenSession(connection, transaction, session, ct);
-        await using var command = new NpgsqlCommand("UPDATE pos.pos_transaction SET status='VOIDED',version=version+1 WHERE id=@id", connection, transaction);
+        await using var command = new SqlCommand("UPDATE pos.pos_transaction SET status='VOIDED',version=version+1 WHERE id=@id", connection, transaction);
         command.Parameters.AddWithValue("id", id);
         var changed = await command.ExecuteNonQueryAsync(ct) != 0;
         await transaction.CommitAsync(ct);
@@ -480,31 +480,31 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     public async Task<bool> DeleteTransaction(Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         await RequireInProgress(connection, transaction, id, ct);
         var session = await GetTransactionSession(connection, transaction, id, ct);
         await RequireOpenSession(connection, transaction, session, ct);
-        await using (var lines = new NpgsqlCommand("DELETE FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
+        await using (var lines = new SqlCommand("DELETE FROM pos.transaction_line WHERE transaction_id=@id", connection, transaction))
         {
             lines.Parameters.AddWithValue("id", id);
             await lines.ExecuteNonQueryAsync(ct);
         }
-        await using var command = new NpgsqlCommand("DELETE FROM pos.pos_transaction WHERE id=@id", connection, transaction);
+        await using var command = new SqlCommand("DELETE FROM pos.pos_transaction WHERE id=@id", connection, transaction);
         command.Parameters.AddWithValue("id", id);
         var changed = await command.ExecuteNonQueryAsync(ct) != 0;
         await transaction.CommitAsync(ct);
         return changed;
     }
 
-    private static async Task<decimal> SellFromStock(NpgsqlConnection connection, NpgsqlTransaction tx, Guid productId,
+    private static async Task<decimal> SellFromStock(SqlConnection connection, SqlTransaction tx, Guid productId,
         decimal requested, short unit, CancellationToken ct)
     {
-        await using var stock = new NpgsqlCommand("SELECT id FROM inventory.stock_level WHERE product_id=@id FOR UPDATE", connection, tx);
+        await using var stock = new SqlCommand("SELECT id FROM inventory.stock_level WHERE product_id=@id FOR UPDATE", connection, tx);
         stock.Parameters.AddWithValue("id", productId);
         var stockId = await stock.ExecuteScalarAsync(ct);
         if (stockId is null) throw new InvalidOperationException($"No stock found for product: {productId}");
         var lots = new List<(Guid EntryId, decimal OnHand, decimal Reserved, decimal UnitCost)>();
-        await using (var query = new NpgsqlCommand("""
+        await using (var query = new SqlCommand("""
             SELECT le.id,le.on_hand_value,le.reserved_value,l.unit_cost
             FROM inventory.lot_entry le JOIN inventory.lot l ON l.id=le.lot_id
             WHERE le.stock_level_id=@id AND le.on_hand_unit_type=@unit
@@ -526,16 +526,16 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
             var take = Math.Min(remaining, lot.OnHand - lot.Reserved);
             if (take <= 0) continue;
             cost = decimal.Round(cost + take * lot.UnitCost, 3, MidpointRounding.AwayFromZero);
-            await using var update = new NpgsqlCommand("UPDATE inventory.lot_entry SET on_hand_value=on_hand_value-@quantity WHERE id=@id", connection, tx);
+            await using var update = new SqlCommand("UPDATE inventory.lot_entry SET on_hand_value=on_hand_value-@quantity WHERE id=@id", connection, tx);
             update.Parameters.AddWithValue("quantity", take);
             update.Parameters.AddWithValue("id", lot.EntryId);
             await update.ExecuteNonQueryAsync(ct);
             remaining -= take;
         }
-        await using var version = new NpgsqlCommand("UPDATE inventory.stock_level SET version=version+1 WHERE id=@id", connection, tx);
+        await using var version = new SqlCommand("UPDATE inventory.stock_level SET version=version+1 WHERE id=@id", connection, tx);
         version.Parameters.AddWithValue("id", (Guid)stockId);
         await version.ExecuteNonQueryAsync(ct);
-        await using var product = new NpgsqlCommand("SELECT COALESCE(p.reorder_point,0),COALESCE(SUM(le.on_hand_value-le.reserved_value),0) FROM inventory.product p LEFT JOIN inventory.stock_level sl ON sl.product_id=p.id LEFT JOIN inventory.lot_entry le ON le.stock_level_id=sl.id WHERE p.id=@id GROUP BY p.id", connection, tx);
+        await using var product = new SqlCommand("SELECT COALESCE(p.reorder_point,0),COALESCE(SUM(le.on_hand_value-le.reserved_value),0) FROM inventory.product p LEFT JOIN inventory.stock_level sl ON sl.product_id=p.id LEFT JOIN inventory.lot_entry le ON le.stock_level_id=sl.id WHERE p.id=@id GROUP BY p.id", connection, tx);
         product.Parameters.AddWithValue("id", productId);
         await using var productReader = await product.ExecuteReaderAsync(ct);
         if (await productReader.ReadAsync(ct) && productReader.GetDecimal(1) <= productReader.GetInt32(0))
@@ -546,10 +546,10 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         return cost;
     }
 
-    private static async Task<IReadOnlyList<PosLineView>> ReadLines(Guid transactionId, NpgsqlConnection connection, CancellationToken ct)
+    private static async Task<IReadOnlyList<PosLineView>> ReadLines(Guid transactionId, SqlConnection connection, CancellationToken ct)
     {
         var lines = new List<PosLineView>();
-        await using var command = new NpgsqlCommand("SELECT id,product_id,value,unit_type,line_total,vat_amount FROM pos.transaction_line WHERE transaction_id=@id ORDER BY id", connection);
+        await using var command = new SqlCommand("SELECT id,product_id,value,unit_type,line_total,vat_amount FROM pos.transaction_line WHERE transaction_id=@id ORDER BY id", connection);
         command.Parameters.AddWithValue("id", transactionId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -563,35 +563,35 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
         return lines;
     }
 
-    private static async Task RequireInProgress(NpgsqlConnection c, NpgsqlTransaction tx, Guid id, CancellationToken ct)
+    private static async Task RequireInProgress(SqlConnection c, SqlTransaction tx, Guid id, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("SELECT status FROM pos.pos_transaction WHERE id=@id FOR UPDATE", c, tx);
+        await using var command = new SqlCommand("SELECT status FROM pos.pos_transaction WHERE id=@id FOR UPDATE", c, tx);
         command.Parameters.AddWithValue("id", id);
         var status = await command.ExecuteScalarAsync(ct) as string ?? throw new ArgumentException($"Ticket not found: {id}");
         if (status != "IN_PROGRESS") throw new InvalidOperationException("Only in-progress tickets can be changed.");
     }
 
-    private static async Task<Guid> GetTransactionSession(NpgsqlConnection c, NpgsqlTransaction tx, Guid id, CancellationToken ct)
+    private static async Task<Guid> GetTransactionSession(SqlConnection c, SqlTransaction tx, Guid id, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id", c, tx);
+        await using var command = new SqlCommand("SELECT cash_session_id FROM pos.pos_transaction WHERE id=@id", c, tx);
         command.Parameters.AddWithValue("id", id);
         return (Guid)(await command.ExecuteScalarAsync(ct) ?? throw new ArgumentException("Ticket not found."));
     }
 
-    private static async Task RequireOpenSession(NpgsqlConnection c, NpgsqlTransaction tx, Guid id, CancellationToken ct)
+    private static async Task RequireOpenSession(SqlConnection c, SqlTransaction tx, Guid id, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("SELECT status FROM pos.cash_session WHERE id=@id FOR UPDATE", c, tx);
+        await using var command = new SqlCommand("SELECT status FROM pos.cash_session WHERE id=@id FOR UPDATE", c, tx);
         command.Parameters.AddWithValue("id", id);
         var status = await command.ExecuteScalarAsync(ct) as string ?? throw new ArgumentException($"Cash session not found: {id}");
         if (status != "OPEN") throw new InvalidOperationException("Cash session is not open.");
     }
 
-    private static TillView ReadTill(NpgsqlDataReader r) => new(r.GetGuid(0), r.GetString(1), r.GetString(2),
+    private static TillView ReadTill(SqlDataReader r) => new(r.GetGuid(0), r.GetString(1), r.GetString(2),
         r.IsDBNull(3) ? null : r.GetString(3), FormatMoney(r.GetDecimal(4)),
         r.IsDBNull(5) ? null : JavaInstantFormat.Format(AsInstant(r.GetDateTime(5))),
         r.IsDBNull(6) ? null : JavaInstantFormat.Format(AsInstant(r.GetDateTime(6))));
 
-    private static SessionView ReadSession(NpgsqlDataReader r) =>
+    private static SessionView ReadSession(SqlDataReader r) =>
         new(r.GetGuid(0), r.GetGuid(1), r.GetString(2), FormatMoney(r.GetDecimal(3)));
 
     private static void ValidateQuantity(decimal value, string unitType)
@@ -608,7 +608,7 @@ public sealed class PosRepository(NpgsqlDataSource dataSource)
     private static DateTimeOffset AsInstant(DateTime value) => new(DateTime.SpecifyKind(value, DateTimeKind.Utc));
 }
 
-public sealed class ScannerPairingService(NpgsqlDataSource dataSource, PosRepository pos)
+public sealed class ScannerPairingService(SqlServerDataSource dataSource, PosRepository pos)
 {
     private static readonly TimeSpan Lifetime = TimeSpan.FromMinutes(30);
     private readonly ConcurrentDictionary<Guid, Pairing> _sessions = new();
@@ -636,7 +636,7 @@ public sealed class ScannerPairingService(NpgsqlDataSource dataSource, PosReposi
         if (transaction.Status != "IN_PROGRESS") throw new InvalidOperationException("Only an in-progress ticket can use the phone scanner.");
         var barcode = rawBarcode?.Trim() ?? "";
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT id,sku,name,unit_type FROM inventory.product WHERE lower(sku)=lower(@sku)", connection);
+        await using var command = new SqlCommand("SELECT id,sku,name,unit_type FROM inventory.product WHERE lower(sku)=lower(@sku)", connection);
         command.Parameters.AddWithValue("sku", barcode);
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) throw new ArgumentException($"No product found for barcode: {barcode}");
@@ -672,3 +672,4 @@ public sealed class ScannerPairingService(NpgsqlDataSource dataSource, PosReposi
 
     private sealed record Pairing(Guid Id, string Token, Guid TransactionId, DateTimeOffset ExpiresAt);
 }
+

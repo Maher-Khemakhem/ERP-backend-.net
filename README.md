@@ -79,6 +79,19 @@ flowchart TD
 - **Infrastructure layer** — `Infrastructure/` provides SQL Server access, environment-file loading, JWT-related startup configuration, exception handling, and background processing.
 - **Persistence layer** — Feature repositories use `Microsoft.Data.SqlClient` to read and write SQL Server. Cross-feature identifiers are passed explicitly rather than through shared entity relationships.
 
+`Program.cs` is intentionally limited to host composition and endpoint mapping. Service registration,
+authentication, authorization, serialization, CORS, and infrastructure workers are composed by
+`Infrastructure/ServiceCollectionExtensions.cs`. This keeps startup concerns out of feature code and
+makes the application boundary straightforward to test and evolve.
+
+All database access uses SQL Server primitives and naming (`SqlConnection`, `SqlCommand`,
+`SqlTransaction`, and `SqlServerDataSource`). Feature code must not introduce provider-specific
+aliases from another database engine.
+
+Unhandled API failures are returned as RFC 7807 `application/problem+json` responses by
+`Infrastructure/ApiExceptionMiddleware.cs`. Expected domain/input failures are mapped to their
+corresponding HTTP status; unexpected failures are logged and do not expose exception details.
+
 ### Feature boundaries
 
 The main feature areas are:

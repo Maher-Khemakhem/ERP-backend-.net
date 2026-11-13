@@ -1,9 +1,9 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.Data.SqlClient;
 
 namespace SupermarketErp.Api.Infrastructure;
 
-public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxProcessor> logger) : BackgroundService
+public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<OutboxProcessor> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -32,8 +32,8 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
         string type;
         string payload;
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var select = new NpgsqlCommand("""
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using (var select = new SqlCommand("""
             SELECT TOP (1) id,event_type,payload FROM platform.dotnet_outbox WITH (UPDLOCK, READPAST, ROWLOCK)
             WHERE processed_at IS NULL
             ORDER BY occurred_at,id
@@ -69,7 +69,7 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
                     throw new InvalidOperationException($"Unknown outbox event type '{type}'.");
             }
 
-            await using var mark = new NpgsqlCommand(
+            await using var mark = new SqlCommand(
                 "UPDATE platform.dotnet_outbox SET processed_at=@now,last_error=NULL WHERE id=@id", connection, transaction);
             mark.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
             mark.Parameters.AddWithValue("id", id);
@@ -89,7 +89,7 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
     {
         logger.LogError(exception, "Failed to process outbox event {OutboxId}", id);
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             UPDATE platform.dotnet_outbox SET attempts=attempts+1,last_error=@error WHERE id=@id
             """, connection);
         command.Parameters.AddWithValue("error", exception.Message.Length > 4000 ? exception.Message[..4000] : exception.Message);
@@ -98,15 +98,15 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
         await Task.Delay(TimeSpan.FromSeconds(2), ct);
     }
 
-    private static Task PostSale(NpgsqlConnection c, NpgsqlTransaction tx, SaleCompletedEvent e, CancellationToken ct) =>
+    private static Task PostSale(SqlConnection c, SqlTransaction tx, SaleCompletedEvent e, CancellationToken ct) =>
         PostSaleCore(c, tx, $"sale:{e.TransactionId}", $"POS sale {e.TransactionId}", e.TransactionId,
             e.PaymentMethod, e.NetAmount, e.VatAmount, e.GrossAmount, e.CostOfGoodsSold, ct);
 
-    private static Task PostOnlineSale(NpgsqlConnection c, NpgsqlTransaction tx, SaleCompletedEvent e, CancellationToken ct) =>
+    private static Task PostOnlineSale(SqlConnection c, SqlTransaction tx, SaleCompletedEvent e, CancellationToken ct) =>
         PostSaleCore(c, tx, $"online-sale:{e.TransactionId}", $"Online sale {e.TransactionId}", e.TransactionId,
             e.PaymentMethod, e.NetAmount, e.VatAmount, e.GrossAmount, e.CostOfGoodsSold, ct);
 
-    private static async Task PostSaleCore(NpgsqlConnection c, NpgsqlTransaction tx, string key, string description,
+    private static async Task PostSaleCore(SqlConnection c, SqlTransaction tx, string key, string description,
         Guid reference, string method, decimal net, decimal vat, decimal gross, decimal cogs, CancellationToken ct)
     {
         var lines = new List<JournalLineInput>
@@ -123,7 +123,7 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
         await PostJournal(c, tx, key, description, reference, lines, ct);
     }
 
-    private static async Task PostCashClose(NpgsqlConnection c, NpgsqlTransaction tx, CashSessionClosedEvent e, CancellationToken ct)
+    private static async Task PostCashClose(SqlConnection c, SqlTransaction tx, CashSessionClosedEvent e, CancellationToken ct)
     {
         if (e.ExpectedCash == 0 && e.CountedCash == 0) return;
         var variance = e.CountedCash - e.ExpectedCash;
@@ -135,7 +135,7 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
         await PostJournal(c, tx, $"cash-close:{e.CashSessionId}", $"Cash session close {e.CashSessionId}", e.CashSessionId, lines, ct);
     }
 
-    private static async Task PostGoodsReceived(NpgsqlConnection c, NpgsqlTransaction tx, GoodsReceivedEvent e, CancellationToken ct)
+    private static async Task PostGoodsReceived(SqlConnection c, SqlTransaction tx, GoodsReceivedEvent e, CancellationToken ct)
     {
         if (e.TotalCost == 0) return;
         await PostJournal(c, tx, $"goods-received:{e.PurchaseOrderId}", $"Goods received for purchase order {e.PurchaseOrderId}",
@@ -144,9 +144,9 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
              new("GOODS_RECEIVED_NOT_INVOICED", 0, e.TotalCost, "Uninvoiced receipt")], ct);
     }
 
-    private static async Task CreateLowStockAlert(NpgsqlConnection c, NpgsqlTransaction tx, Guid productId, CancellationToken ct)
+    private static async Task CreateLowStockAlert(SqlConnection c, SqlTransaction tx, Guid productId, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             INSERT INTO procurement.low_stock_alert(id,product_id,raised_at,acknowledged)
             VALUES(@id,@product,@now,0)
             """, c, tx);
@@ -156,14 +156,14 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
         await command.ExecuteNonQueryAsync(ct);
     }
 
-    private static async Task PostJournal(NpgsqlConnection c, NpgsqlTransaction tx, string key,
+    private static async Task PostJournal(SqlConnection c, SqlTransaction tx, string key,
         string description, Guid? reference, IReadOnlyList<JournalLineInput> lines, CancellationToken ct)
     {
         var debits = lines.Sum(line => line.Debit);
         var credits = lines.Sum(line => line.Credit);
         if (debits != credits) throw new InvalidOperationException($"Journal entry {key} is unbalanced.");
         var entryId = Guid.NewGuid();
-        await using (var entry = new NpgsqlCommand("""
+        await using (var entry = new SqlCommand("""
             IF EXISTS (SELECT 1 FROM finance.journal_entry WHERE event_key=@key)
                 SELECT CAST(NULL AS uniqueidentifier);
             ELSE
@@ -185,7 +185,7 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
         }
         foreach (var line in lines)
         {
-            await using var insertLine = new NpgsqlCommand("""
+            await using var insertLine = new SqlCommand("""
                 INSERT INTO finance.journal_line(id,journal_entry_id,account_code,debit_amount,credit_amount,description)
                 VALUES(@id,@entry,@account,@debit,@credit,@description)
                 """, c, tx);
@@ -201,3 +201,4 @@ public sealed class OutboxProcessor(NpgsqlDataSource dataSource, ILogger<OutboxP
 
     private sealed record JournalLineInput(string Account, decimal Debit, decimal Credit, string Description);
 }
+

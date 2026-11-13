@@ -1,4 +1,4 @@
-using Microsoft.Data.SqlClient;
+﻿using Microsoft.Data.SqlClient;
 using SupermarketErp.Api.Features.Auth;
 
 namespace SupermarketErp.Api.Features.Inventory;
@@ -66,13 +66,13 @@ public static class InventoryEndpoints
     }
 }
 
-public sealed class InventoryRepository(NpgsqlDataSource dataSource)
+public sealed class InventoryRepository(SqlServerDataSource dataSource)
 {
     public async Task<IReadOnlyList<FamilyView>> ListFamilies(CancellationToken ct)
     {
         var families = new List<FamilyView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(
+        await using var command = new SqlCommand(
             "SELECT id, name, image_url FROM inventory.product_family ORDER BY name", connection);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -86,13 +86,13 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
         if (request.Name.Trim().Length > 160) throw new ArgumentException("Family name cannot exceed 160 characters.");
         if (request.ImageUrl?.Length > 500) throw new ArgumentException("Image URL cannot exceed 500 characters.");
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var exists = new NpgsqlCommand(
+        await using var exists = new SqlCommand(
             "SELECT EXISTS(SELECT 1 FROM inventory.product_family WHERE lower(name) = lower(@name))", connection);
         exists.Parameters.AddWithValue("name", request.Name.Trim());
         if ((bool)(await exists.ExecuteScalarAsync(ct) ?? false))
             throw new InvalidOperationException("A product family with this name already exists.");
         var id = Guid.NewGuid();
-        await using var insert = new NpgsqlCommand(
+        await using var insert = new SqlCommand(
             "INSERT INTO inventory.product_family(id, name, image_url) VALUES(@id, @name, @image_url)", connection);
         insert.Parameters.AddWithValue("id", id);
         insert.Parameters.AddWithValue("name", request.Name.Trim());
@@ -120,7 +120,7 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
             """;
         var list = new List<StockSummaryView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(sql, connection);
+        await using var command = new SqlCommand(sql, connection);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
@@ -141,7 +141,7 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
     public async Task<StockLevelView?> GetStock(Guid productId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var productCommand = new NpgsqlCommand(
+        await using var productCommand = new SqlCommand(
             "SELECT name FROM inventory.product WHERE id = @id", connection);
         productCommand.Parameters.AddWithValue("id", productId);
         var name = await productCommand.ExecuteScalarAsync(ct) as string;
@@ -158,7 +158,7 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
             """;
         var lots = new List<LotView>();
         decimal total = 0, reserved = 0;
-        await using var command = new NpgsqlCommand(sql, connection);
+        await using var command = new SqlCommand(sql, connection);
         command.Parameters.AddWithValue("product_id", productId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -189,10 +189,10 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
             : request.QuantityValue;
 
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         bool perishable;
         string productUnit;
-        await using (var product = new NpgsqlCommand(
+        await using (var product = new SqlCommand(
             "SELECT unit_type, perishable FROM inventory.product WHERE id = @id", connection, transaction))
         {
             product.Parameters.AddWithValue("id", request.ProductId);
@@ -207,7 +207,7 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
             throw new ArgumentException("Perishable products require an expiry date.");
 
         var stockId = Guid.NewGuid();
-        await using (var stock = new NpgsqlCommand("""
+        await using (var stock = new SqlCommand("""
             INSERT INTO inventory.stock_level(id, product_id, version) VALUES(@id, @product_id, 0)
             ON CONFLICT(product_id) DO UPDATE SET version = inventory.stock_level.version + 1
             RETURNING id
@@ -222,7 +222,7 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
         var lotNumber = string.IsNullOrWhiteSpace(request.LotNumber)
             ? $"LOT-{Guid.NewGuid().ToString("N")[..8].ToUpperInvariant()}"
             : request.LotNumber.Trim();
-        await using (var lot = new NpgsqlCommand("""
+        await using (var lot = new SqlCommand("""
             INSERT INTO inventory.lot(id, lot_number, product_id, expiry_date, received_date, supplier_reference, unit_cost)
             VALUES(@id, @lot_number, @product_id, @expiry_date, @received_date, @supplier_reference, @unit_cost)
             """, connection, transaction))
@@ -237,7 +237,7 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
             await lot.ExecuteNonQueryAsync(ct);
         }
 
-        await using (var entry = new NpgsqlCommand("""
+        await using (var entry = new SqlCommand("""
             INSERT INTO inventory.lot_entry
                 (id, stock_level_id, lot_id, on_hand_value, on_hand_unit_type, reserved_value, reserved_unit_type)
             VALUES(@id, @stock_id, @lot_id, @quantity, @unit_type, 0, @unit_type)
@@ -255,3 +255,4 @@ public sealed class InventoryRepository(NpgsqlDataSource dataSource)
 
     private static string? Normalize(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }
+

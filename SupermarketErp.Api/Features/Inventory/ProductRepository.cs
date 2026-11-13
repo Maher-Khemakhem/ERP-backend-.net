@@ -1,8 +1,8 @@
-using Microsoft.Data.SqlClient;
+﻿using Microsoft.Data.SqlClient;
 
 namespace SupermarketErp.Api.Features.Inventory;
 
-public sealed class ProductRepository(NpgsqlDataSource dataSource)
+public sealed class ProductRepository(SqlServerDataSource dataSource)
 {
     private const string SelectColumns = """
         SELECT p.id, p.sku, p.name, p.family_id, f.name, f.image_url, p.image_url,
@@ -15,7 +15,7 @@ public sealed class ProductRepository(NpgsqlDataSource dataSource)
     {
         var products = new List<ProductView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(SelectColumns + " ORDER BY p.name, p.sku", connection);
+        await using var command = new SqlCommand(SelectColumns + " ORDER BY p.name, p.sku", connection);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) products.Add(ReadProduct(reader));
         return products;
@@ -24,7 +24,7 @@ public sealed class ProductRepository(NpgsqlDataSource dataSource)
     public async Task<ProductView?> Get(Guid productId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(SelectColumns + " WHERE p.id = @id", connection);
+        await using var command = new SqlCommand(SelectColumns + " WHERE p.id = @id", connection);
         command.Parameters.AddWithValue("id", productId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadProduct(reader) : null;
@@ -36,7 +36,7 @@ public sealed class ProductRepository(NpgsqlDataSource dataSource)
         await using var connection = await dataSource.OpenConnectionAsync(ct);
         if (request.FamilyId is not null)
         {
-            await using var familyCheck = new NpgsqlCommand(
+            await using var familyCheck = new SqlCommand(
                 "SELECT EXISTS(SELECT 1 FROM inventory.product_family WHERE id = @id)", connection);
             familyCheck.Parameters.AddWithValue("id", request.FamilyId.Value);
             if (!(bool)(await familyCheck.ExecuteScalarAsync(ct) ?? false))
@@ -44,7 +44,7 @@ public sealed class ProductRepository(NpgsqlDataSource dataSource)
         }
 
         var id = Guid.NewGuid();
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             INSERT INTO inventory.product
                 (id, sku, name, family_id, image_url, unit_type, perishable, reorder_point, vat_rate, online_visible)
             VALUES
@@ -66,12 +66,12 @@ public sealed class ProductRepository(NpgsqlDataSource dataSource)
     public async Task<bool> Delete(Guid productId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("DELETE FROM inventory.product WHERE id = @id", connection);
+        await using var command = new SqlCommand("DELETE FROM inventory.product WHERE id = @id", connection);
         command.Parameters.AddWithValue("id", productId);
         return await command.ExecuteNonQueryAsync(ct) != 0;
     }
 
-    private static ProductView ReadProduct(NpgsqlDataReader reader) => new(
+    private static ProductView ReadProduct(SqlDataReader reader) => new(
         reader.GetGuid(0),
         reader.GetString(1),
         reader.GetString(2),
@@ -97,3 +97,4 @@ public sealed class ProductRepository(NpgsqlDataSource dataSource)
 
     private static string? NormalizeOptional(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }
+

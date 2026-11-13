@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using Microsoft.Data.SqlClient;
@@ -73,7 +73,7 @@ public static class StorefrontOrderEndpoints
         ? id : throw new InvalidOperationException("The authenticated token has no user ID.");
 }
 
-public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfiguration configuration)
+public sealed class StorefrontOrderService(SqlServerDataSource dataSource, IConfiguration configuration)
 {
     private readonly int _paymentTimeoutMinutes = ReadPositive(configuration, "ECOMMERCE_PAYMENT_TIMEOUT_MINUTES", 15);
 
@@ -88,10 +88,10 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
     {
         ValidateQuantity(request.QuantityValue, request.UnitType);
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var cartId = await GetOrCreateCart(connection, tx, customerId, ct);
         var unit = await ValidateProduct(connection, tx, request.ProductId, request.UnitType, ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             INSERT INTO ecommerce.cart_item(id,cart_id,product_id,quantity_value,quantity_unit_type)
             VALUES(@id,@cart,@product,@quantity,@unit)
             ON CONFLICT(cart_id,product_id) DO UPDATE SET quantity_value=ecommerce.cart_item.quantity_value+EXCLUDED.quantity_value
@@ -110,10 +110,10 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
     {
         ValidateQuantity(request.QuantityValue, request.UnitType);
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var cartId = await RequireCart(connection, tx, customerId, ct);
         var unit = await ValidateProduct(connection, tx, request.ProductId, request.UnitType, ct);
-        await using var command = new NpgsqlCommand("UPDATE ecommerce.cart_item SET quantity_value=@quantity,quantity_unit_type=@unit WHERE cart_id=@cart AND product_id=@product", connection, tx);
+        await using var command = new SqlCommand("UPDATE ecommerce.cart_item SET quantity_value=@quantity,quantity_unit_type=@unit WHERE cart_id=@cart AND product_id=@product", connection, tx);
         command.Parameters.AddWithValue("quantity", request.QuantityValue); command.Parameters.AddWithValue("unit", unit);
         command.Parameters.AddWithValue("cart", cartId); command.Parameters.AddWithValue("product", request.ProductId);
         if (await command.ExecuteNonQueryAsync(ct) == 0) throw new InvalidOperationException("Cart item not found.");
@@ -126,9 +126,9 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
     public async Task<CartView> RemoveCartItem(Guid customerId, Guid productId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var cartId = await RequireCart(connection, tx, customerId, ct);
-        await using var command = new NpgsqlCommand("DELETE FROM ecommerce.cart_item WHERE cart_id=@cart AND product_id=@product", connection, tx);
+        await using var command = new SqlCommand("DELETE FROM ecommerce.cart_item WHERE cart_id=@cart AND product_id=@product", connection, tx);
         command.Parameters.AddWithValue("cart", cartId); command.Parameters.AddWithValue("product", productId);
         await command.ExecuteNonQueryAsync(ct);
         await TouchCart(connection, tx, cartId, ct);
@@ -140,9 +140,9 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
     public async Task<OnlineOrderView> Checkout(Guid customerId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var cartId = await GetOrCreateCart(connection, tx, customerId, ct);
-        await using (var lockCart = new NpgsqlCommand("SELECT id FROM ecommerce.cart WHERE id=@id FOR UPDATE", connection, tx))
+        await using (var lockCart = new SqlCommand("SELECT id FROM ecommerce.cart WHERE id=@id FOR UPDATE", connection, tx))
         { lockCart.Parameters.AddWithValue("id", cartId); await lockCart.ExecuteScalarAsync(ct); }
         var cart = await ReadPricedCartRows(connection, tx, cartId, ct);
         if (cart.Count == 0) throw new InvalidOperationException("Cannot check out an empty cart.");
@@ -159,7 +159,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
             net += lineNet; vat += lineVat;
         }
         net = Money(net); vat = Money(vat);
-        await using (var order = new NpgsqlCommand("""
+        await using (var order = new SqlCommand("""
             INSERT INTO ecommerce.online_order(id,order_number,customer_id,status,net_amount,vat_amount,total_amount,payment_reference,created_at,confirmed_at,version,expires_at,cancelled_at,expired_at,pickup_code,picked_up_at,picked_up_by)
             VALUES(@id,@number,@customer,'PENDING_PAYMENT',@net,@vat,@total,NULL,@now,NULL,0,@expires,NULL,NULL,NULL,NULL,NULL)
             """, connection, tx))
@@ -175,7 +175,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
             var lineNet = Money(item.UnitPrice * item.Quantity);
             var lineVat = Money(lineNet * item.VatRate / 100m);
             await ReserveStock(connection, tx, item.ProductId, item.Quantity, item.UnitType, ct);
-            await using var line = new NpgsqlCommand("""
+            await using var line = new SqlCommand("""
                 INSERT INTO ecommerce.online_order_line(id,online_order_id,product_id,product_name,quantity_value,quantity_unit_type,unit_price,line_total,vat_amount)
                 VALUES(@id,@order,@product,@name,@quantity,@unit,@price,@total,@vat)
                 """, connection, tx);
@@ -185,7 +185,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
             line.Parameters.AddWithValue("price", item.UnitPrice); line.Parameters.AddWithValue("total", lineNet + lineVat);
             line.Parameters.AddWithValue("vat", lineVat); await line.ExecuteNonQueryAsync(ct);
         }
-        await using (var clear = new NpgsqlCommand("DELETE FROM ecommerce.cart_item WHERE cart_id=@id", connection, tx))
+        await using (var clear = new SqlCommand("DELETE FROM ecommerce.cart_item WHERE cart_id=@id", connection, tx))
         { clear.Parameters.AddWithValue("id", cartId); await clear.ExecuteNonQueryAsync(ct); }
         await TouchCart(connection, tx, cartId, ct);
         await tx.CommitAsync(ct);
@@ -202,7 +202,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         string paymentMethod, bool expireIfDue, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var order = await ReadOrderHeader(connection, tx, orderId, ct);
         if (order is null || (customerId is not null && order.CustomerId != customerId)) throw new ArgumentException("Order not found.");
         if (order.Status == "CONFIRMED") { await tx.CommitAsync(ct); return await GetOrder(orderId, ct); }
@@ -211,7 +211,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         {
             var expiredLines = await ReadOrderLineRows(connection, tx, orderId, ct);
             foreach (var line in expiredLines) await ReleaseReservedStock(connection, tx, line.ProductId, line.Quantity, line.UnitType, ct);
-            await using var expire = new NpgsqlCommand("UPDATE ecommerce.online_order SET status='EXPIRED',expired_at=@now,version=version+1 WHERE id=@id", connection, tx);
+            await using var expire = new SqlCommand("UPDATE ecommerce.online_order SET status='EXPIRED',expired_at=@now,version=version+1 WHERE id=@id", connection, tx);
             expire.Parameters.AddWithValue("now", DateTimeOffset.UtcNow); expire.Parameters.AddWithValue("id", orderId);
             await expire.ExecuteNonQueryAsync(ct);
             await tx.CommitAsync(ct);
@@ -223,7 +223,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         decimal cogs = 0;
         foreach (var line in lines)
             cogs += await ConsumeReservedStock(connection, tx, line.ProductId, line.Quantity, line.UnitType, ct);
-        await using (var update = new NpgsqlCommand("UPDATE ecommerce.online_order SET status='CONFIRMED',payment_reference=@reference,confirmed_at=@now,version=version+1 WHERE id=@id", connection, tx))
+        await using (var update = new SqlCommand("UPDATE ecommerce.online_order SET status='CONFIRMED',payment_reference=@reference,confirmed_at=@now,version=version+1 WHERE id=@id", connection, tx))
         {
             update.Parameters.AddWithValue("reference", paymentReference); update.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
             update.Parameters.AddWithValue("id", orderId); await update.ExecuteNonQueryAsync(ct);
@@ -270,9 +270,9 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
     public async Task ExpireDueOrders(CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var ids = new List<Guid>();
-        await using (var select = new NpgsqlCommand("""
+        await using (var select = new SqlCommand("""
             SELECT id FROM ecommerce.online_order WHERE status='PENDING_PAYMENT' AND expires_at<=@now
             ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED
             """, connection, tx))
@@ -285,7 +285,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         {
             var lines = await ReadOrderLineRows(connection, tx, id, ct);
             foreach (var line in lines) await ReleaseReservedStock(connection, tx, line.ProductId, line.Quantity, line.UnitType, ct);
-            await using var update = new NpgsqlCommand("UPDATE ecommerce.online_order SET status='EXPIRED',expired_at=@now,version=version+1 WHERE id=@id AND status='PENDING_PAYMENT'", connection, tx);
+            await using var update = new SqlCommand("UPDATE ecommerce.online_order SET status='EXPIRED',expired_at=@now,version=version+1 WHERE id=@id AND status='PENDING_PAYMENT'", connection, tx);
             update.Parameters.AddWithValue("now", DateTimeOffset.UtcNow); update.Parameters.AddWithValue("id", id);
             await update.ExecuteNonQueryAsync(ct);
         }
@@ -297,13 +297,13 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         var desired = next.Trim().ToUpperInvariant();
         if (desired is not ("PREPARING" or "READY")) throw new ArgumentException("Staff can advance orders to PREPARING or READY.");
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var current = await ReadOrderHeader(connection, tx, id, ct);
         if (current is null) throw new ArgumentException($"Online order not found: {id}");
         var allowed = (current.Status == "CONFIRMED" && desired == "PREPARING") || (current.Status == "PREPARING" && desired == "READY");
         if (!allowed) throw new InvalidOperationException($"Online order cannot move from {current.Status} to {desired}.");
         var code = desired == "READY" ? Convert.ToHexString(RandomNumberGenerator.GetBytes(6)) : null;
-        await using var update = new NpgsqlCommand("UPDATE ecommerce.online_order SET status=@status,pickup_code=@code,version=version+1 WHERE id=@id", connection, tx);
+        await using var update = new SqlCommand("UPDATE ecommerce.online_order SET status=@status,pickup_code=@code,version=version+1 WHERE id=@id", connection, tx);
         update.Parameters.AddWithValue("status", desired); update.Parameters.AddWithValue("code", (object?)code ?? DBNull.Value);
         update.Parameters.AddWithValue("id", id); await update.ExecuteNonQueryAsync(ct);
         await tx.CommitAsync(ct);
@@ -313,14 +313,14 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
     public async Task<StaffOnlineOrderView> CompletePickup(Guid id, string code, string staff, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var current = await ReadOrderHeader(connection, tx, id, ct);
         if (current is null) throw new ArgumentException($"Online order not found: {id}");
         if (current.Status != "READY" || string.IsNullOrWhiteSpace(code)) throw new InvalidOperationException("Only ready orders can be collected with a pickup code.");
         var normalized = code.Replace("-", "").Replace(" ", "").ToUpperInvariant();
         if (!CryptographicOperations.FixedTimeEquals(System.Text.Encoding.ASCII.GetBytes(normalized), System.Text.Encoding.ASCII.GetBytes(current.PickupCode ?? "")))
             throw new ArgumentException("Invalid pickup code.");
-        await using var update = new NpgsqlCommand("UPDATE ecommerce.online_order SET status='COMPLETED',pickup_code=NULL,picked_up_at=@now,picked_up_by=@staff,version=version+1 WHERE id=@id", connection, tx);
+        await using var update = new SqlCommand("UPDATE ecommerce.online_order SET status='COMPLETED',pickup_code=NULL,picked_up_at=@now,picked_up_by=@staff,version=version+1 WHERE id=@id", connection, tx);
         update.Parameters.AddWithValue("now", DateTimeOffset.UtcNow); update.Parameters.AddWithValue("staff", staff);
         update.Parameters.AddWithValue("id", id); await update.ExecuteNonQueryAsync(ct);
         await tx.CommitAsync(ct);
@@ -337,7 +337,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
     private async Task<OnlineOrderView> Cancel(Guid id, Guid? customerId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var order = await ReadOrderHeader(connection, tx, id, ct);
         if (order is null || (customerId is not null && order.CustomerId != customerId))
             throw new ArgumentException($"Online order not found: {id}");
@@ -346,7 +346,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         await EnsureNoActiveStripeCheckout(connection, tx, id, ct);
         var lines = await ReadOrderLineRows(connection, tx, id, ct);
         foreach (var line in lines) await ReleaseReservedStock(connection, tx, line.ProductId, line.Quantity, line.UnitType, ct);
-        await using var update = new NpgsqlCommand("UPDATE ecommerce.online_order SET status='CANCELLED',cancelled_at=@now,version=version+1 WHERE id=@id", connection, tx);
+        await using var update = new SqlCommand("UPDATE ecommerce.online_order SET status='CANCELLED',cancelled_at=@now,version=version+1 WHERE id=@id", connection, tx);
         update.Parameters.AddWithValue("now", DateTimeOffset.UtcNow); update.Parameters.AddWithValue("id", id);
         await update.ExecuteNonQueryAsync(ct);
         await tx.CommitAsync(ct);
@@ -369,7 +369,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
                    o.pickup_code,(SELECT sc.status FROM ecommerce.stripe_checkout sc WHERE sc.order_id=o.id)
             FROM ecommerce.online_order o
             """ + filter + " ORDER BY o.created_at DESC";
-        await using (var command = new NpgsqlCommand(sql, connection))
+        await using (var command = new SqlCommand(sql, connection))
         {
             if (customer is not null) command.Parameters.AddWithValue("customer", customer.Value);
             if (order is not null) command.Parameters.AddWithValue("order", order.Value);
@@ -381,10 +381,10 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         return list;
     }
 
-    private async Task<OnlineOrderView> ToView(OrderHead h, NpgsqlConnection connection, CancellationToken ct)
+    private async Task<OnlineOrderView> ToView(OrderHead h, SqlConnection connection, CancellationToken ct)
     {
         var lines = new List<OrderLineView>();
-        await using var command = new NpgsqlCommand("SELECT product_id,product_name,quantity_value,quantity_unit_type,unit_price,line_total,vat_amount FROM ecommerce.online_order_line WHERE online_order_id=@id ORDER BY id", connection);
+        await using var command = new SqlCommand("SELECT product_id,product_name,quantity_value,quantity_unit_type,unit_price,line_total,vat_amount FROM ecommerce.online_order_line WHERE online_order_id=@id ORDER BY id", connection);
         command.Parameters.AddWithValue("id", h.Id);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -393,35 +393,35 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         return h.ToView(lines);
     }
 
-    private async Task<OrderHead?> ReadOrderHeader(NpgsqlConnection c, NpgsqlTransaction tx, Guid id, CancellationToken ct)
+    private async Task<OrderHead?> ReadOrderHeader(SqlConnection c, SqlTransaction tx, Guid id, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("SELECT id,order_number,customer_id,status,net_amount,vat_amount,total_amount,payment_reference,created_at,confirmed_at,expires_at,cancelled_at,expired_at,pickup_code FROM ecommerce.online_order WHERE id=@id FOR UPDATE", c, tx);
+        await using var command = new SqlCommand("SELECT id,order_number,customer_id,status,net_amount,vat_amount,total_amount,payment_reference,created_at,confirmed_at,expires_at,cancelled_at,expired_at,pickup_code FROM ecommerce.online_order WHERE id=@id FOR UPDATE", c, tx);
         command.Parameters.AddWithValue("id", id);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadHead(reader) : null;
     }
 
-    private async Task<List<OrderLineRow>> ReadOrderLineRows(NpgsqlConnection c, NpgsqlTransaction tx, Guid orderId, CancellationToken ct)
+    private async Task<List<OrderLineRow>> ReadOrderLineRows(SqlConnection c, SqlTransaction tx, Guid orderId, CancellationToken ct)
     {
         var lines = new List<OrderLineRow>();
-        await using var command = new NpgsqlCommand("SELECT product_id,quantity_value,quantity_unit_type FROM ecommerce.online_order_line WHERE online_order_id=@id", c, tx);
+        await using var command = new SqlCommand("SELECT product_id,quantity_value,quantity_unit_type FROM ecommerce.online_order_line WHERE online_order_id=@id", c, tx);
         command.Parameters.AddWithValue("id", orderId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) lines.Add(new OrderLineRow(reader.GetGuid(0), reader.GetDecimal(1), reader.GetString(2)));
         return lines;
     }
 
-    private static async Task EnsureNoActiveStripeCheckout(NpgsqlConnection c, NpgsqlTransaction tx, Guid orderId, CancellationToken ct)
+    private static async Task EnsureNoActiveStripeCheckout(SqlConnection c, SqlTransaction tx, Guid orderId, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM ecommerce.stripe_checkout WHERE order_id=@id AND status IN ('CREATING','PENDING'))", c, tx);
+        await using var command = new SqlCommand("SELECT EXISTS(SELECT 1 FROM ecommerce.stripe_checkout WHERE order_id=@id AND status IN ('CREATING','PENDING'))", c, tx);
         command.Parameters.AddWithValue("id", orderId);
         if ((bool)(await command.ExecuteScalarAsync(ct) ?? false))
             throw new InvalidOperationException("An active Stripe Checkout exists for this order.");
     }
 
-    private static async Task EnsureNoStripeCheckout(NpgsqlConnection c, NpgsqlTransaction tx, Guid orderId, CancellationToken ct)
+    private static async Task EnsureNoStripeCheckout(SqlConnection c, SqlTransaction tx, Guid orderId, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM ecommerce.stripe_checkout WHERE order_id=@id)", c, tx);
+        await using var command = new SqlCommand("SELECT EXISTS(SELECT 1 FROM ecommerce.stripe_checkout WHERE order_id=@id)", c, tx);
         command.Parameters.AddWithValue("id", orderId);
         if ((bool)(await command.ExecuteScalarAsync(ct) ?? false))
             throw new InvalidOperationException("This order has a Stripe Checkout; demo payment is unavailable.");
@@ -430,7 +430,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
     private async Task<(Guid Id, string Username, string DisplayName, string? PickedUpAt, string? PickedUpBy)> FindCustomer(Guid orderId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT u.id,u.username,u.display_name,o.picked_up_at,o.picked_up_by FROM ecommerce.online_order o JOIN dbo.app_user u ON u.id=o.customer_id WHERE o.id=@id", connection);
+        await using var command = new SqlCommand("SELECT u.id,u.username,u.display_name,o.picked_up_at,o.picked_up_by FROM ecommerce.online_order o JOIN dbo.app_user u ON u.id=o.customer_id WHERE o.id=@id", connection);
         command.Parameters.AddWithValue("id", orderId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct)
@@ -438,29 +438,29 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
             : (Guid.Empty, "Unknown", "Unknown customer", null, null);
     }
 
-    private static async Task<Guid> GetOrCreateCart(NpgsqlConnection c, NpgsqlTransaction? tx, Guid customer, CancellationToken ct)
+    private static async Task<Guid> GetOrCreateCart(SqlConnection c, SqlTransaction? tx, Guid customer, CancellationToken ct)
     {
         var id = Guid.NewGuid(); var now = DateTimeOffset.UtcNow;
-        await using var command = new NpgsqlCommand("INSERT INTO ecommerce.cart(id,customer_id,version,created_at,updated_at) VALUES(@id,@customer,0,@now,@now) ON CONFLICT(customer_id) DO UPDATE SET customer_id=EXCLUDED.customer_id RETURNING id", c, tx);
+        await using var command = new SqlCommand("INSERT INTO ecommerce.cart(id,customer_id,version,created_at,updated_at) VALUES(@id,@customer,0,@now,@now) ON CONFLICT(customer_id) DO UPDATE SET customer_id=EXCLUDED.customer_id RETURNING id", c, tx);
         command.Parameters.AddWithValue("id", id); command.Parameters.AddWithValue("customer", customer); command.Parameters.AddWithValue("now", now);
         return (Guid)(await command.ExecuteScalarAsync(ct))!;
     }
 
-    private static async Task<Guid> RequireCart(NpgsqlConnection c, NpgsqlTransaction tx, Guid customer, CancellationToken ct)
+    private static async Task<Guid> RequireCart(SqlConnection c, SqlTransaction tx, Guid customer, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("SELECT id FROM ecommerce.cart WHERE customer_id=@customer FOR UPDATE", c, tx);
+        await using var command = new SqlCommand("SELECT id FROM ecommerce.cart WHERE customer_id=@customer FOR UPDATE", c, tx);
         command.Parameters.AddWithValue("customer", customer);
         return (Guid)(await command.ExecuteScalarAsync(ct) ?? throw new InvalidOperationException("Cart not found."));
     }
 
-    private static async Task TouchCart(NpgsqlConnection c, NpgsqlTransaction tx, Guid id, CancellationToken ct)
+    private static async Task TouchCart(SqlConnection c, SqlTransaction tx, Guid id, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("UPDATE ecommerce.cart SET updated_at=@now,version=version+1 WHERE id=@id", c, tx);
+        await using var command = new SqlCommand("UPDATE ecommerce.cart SET updated_at=@now,version=version+1 WHERE id=@id", c, tx);
         command.Parameters.AddWithValue("now", DateTimeOffset.UtcNow); command.Parameters.AddWithValue("id", id);
         await command.ExecuteNonQueryAsync(ct);
     }
 
-    private static async Task<CartView> ReadCart(NpgsqlConnection c, NpgsqlTransaction? tx, Guid id, CancellationToken ct)
+    private static async Task<CartView> ReadCart(SqlConnection c, SqlTransaction? tx, Guid id, CancellationToken ct)
     {
         var rows = await ReadPricedCartRows(c, tx, id, ct);
         var items = new List<CartItemView>(); decimal subtotal = 0, vat = 0;
@@ -476,7 +476,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         return new CartView(items, FormatMoney(subtotal), FormatMoney(vat), FormatMoney(subtotal + vat));
     }
 
-    private static async Task<List<CartRow>> ReadPricedCartRows(NpgsqlConnection c, NpgsqlTransaction? tx, Guid cartId, CancellationToken ct)
+    private static async Task<List<CartRow>> ReadPricedCartRows(SqlConnection c, SqlTransaction? tx, Guid cartId, CancellationToken ct)
     {
         const string sql = """
             SELECT ci.product_id,p.name,ci.quantity_value,ci.quantity_unit_type,
@@ -489,7 +489,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
             WHERE ci.cart_id=@cart ORDER BY p.name
             """;
         var list = new List<CartRow>();
-        await using var command = new NpgsqlCommand(sql, c, tx);
+        await using var command = new SqlCommand(sql, c, tx);
         command.Parameters.AddWithValue("now", DateTimeOffset.UtcNow); command.Parameters.AddWithValue("cart", cartId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) list.Add(new CartRow(reader.GetGuid(0), reader.GetString(1), reader.GetDecimal(2),
@@ -497,11 +497,11 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         return list;
     }
 
-    private static async Task<string> ValidateProduct(NpgsqlConnection c, NpgsqlTransaction tx, Guid productId, string requested, CancellationToken ct)
+    private static async Task<string> ValidateProduct(SqlConnection c, SqlTransaction tx, Guid productId, string requested, CancellationToken ct)
     {
         var unit = requested.Trim().ToUpperInvariant();
         if (unit is not ("EACH" or "WEIGHT")) throw new ArgumentException("Unit type must be EACH or WEIGHT.");
-        await using var command = new NpgsqlCommand("SELECT unit_type,online_visible FROM inventory.product WHERE id=@id", c, tx);
+        await using var command = new SqlCommand("SELECT unit_type,online_visible FROM inventory.product WHERE id=@id", c, tx);
         command.Parameters.AddWithValue("id", productId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct) || !reader.GetBoolean(1)) throw new ArgumentException("Product is not available in the online catalog.");
@@ -518,7 +518,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         if (type == "WEIGHT" && decimal.Round(value, 3) != value) throw new ArgumentException("WEIGHT quantity supports three decimal places.");
     }
 
-    private static async Task ReserveStock(NpgsqlConnection c, NpgsqlTransaction tx, Guid productId, decimal quantity, string unitType, CancellationToken ct)
+    private static async Task ReserveStock(SqlConnection c, SqlTransaction tx, Guid productId, decimal quantity, string unitType, CancellationToken ct)
     {
         var lots = await LockLots(c, tx, productId, unitType, ct);
         var available = lots.Sum(x => x.OnHand - x.Reserved);
@@ -529,14 +529,14 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
             if (remain <= 0) break;
             var reserve = Math.Min(remain, lot.OnHand - lot.Reserved);
             if (reserve <= 0) continue;
-            await using var update = new NpgsqlCommand("UPDATE inventory.lot_entry SET reserved_value=reserved_value+@q WHERE id=@id", c, tx);
+            await using var update = new SqlCommand("UPDATE inventory.lot_entry SET reserved_value=reserved_value+@q WHERE id=@id", c, tx);
             update.Parameters.AddWithValue("q", reserve); update.Parameters.AddWithValue("id", lot.EntryId); await update.ExecuteNonQueryAsync(ct);
             remain -= reserve;
         }
         await BumpStockVersion(c, tx, productId, ct);
     }
 
-    private static async Task<decimal> ConsumeReservedStock(NpgsqlConnection c, NpgsqlTransaction tx, Guid productId, decimal quantity, string unit, CancellationToken ct)
+    private static async Task<decimal> ConsumeReservedStock(SqlConnection c, SqlTransaction tx, Guid productId, decimal quantity, string unit, CancellationToken ct)
     {
         var lots = await LockLots(c, tx, productId, unit, ct);
         if (lots.Sum(x => x.Reserved) < quantity) throw new InvalidOperationException("Reserved stock is insufficient.");
@@ -545,12 +545,12 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         {
             if (remain <= 0) break;
             var take = Math.Min(remain, lot.Reserved);
-            await using var update = new NpgsqlCommand("UPDATE inventory.lot_entry SET on_hand_value=on_hand_value-@q,reserved_value=reserved_value-@q WHERE id=@id", c, tx);
+            await using var update = new SqlCommand("UPDATE inventory.lot_entry SET on_hand_value=on_hand_value-@q,reserved_value=reserved_value-@q WHERE id=@id", c, tx);
             update.Parameters.AddWithValue("q", take); update.Parameters.AddWithValue("id", lot.EntryId); await update.ExecuteNonQueryAsync(ct);
             cost = Money(cost + take * lot.UnitCost); remain -= take;
         }
         await BumpStockVersion(c, tx, productId, ct);
-        await using (var check = new NpgsqlCommand("""
+        await using (var check = new SqlCommand("""
             SELECT COALESCE(p.reorder_point,0),COALESCE(SUM(le.on_hand_value-le.reserved_value),0)
             FROM inventory.product p
             LEFT JOIN inventory.stock_level sl ON sl.product_id=p.id
@@ -569,7 +569,7 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         return cost;
     }
 
-    private static async Task ReleaseReservedStock(NpgsqlConnection c, NpgsqlTransaction tx, Guid productId, decimal quantity, string unit, CancellationToken ct)
+    private static async Task ReleaseReservedStock(SqlConnection c, SqlTransaction tx, Guid productId, decimal quantity, string unit, CancellationToken ct)
     {
         var lots = await LockLots(c, tx, productId, unit, ct);
         if (lots.Sum(x => x.Reserved) < quantity) throw new InvalidOperationException("Reserved stock is insufficient to release.");
@@ -578,22 +578,22 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         {
             if (remain <= 0) break;
             var release = Math.Min(remain, lot.Reserved);
-            await using var update = new NpgsqlCommand("UPDATE inventory.lot_entry SET reserved_value=reserved_value-@q WHERE id=@id", c, tx);
+            await using var update = new SqlCommand("UPDATE inventory.lot_entry SET reserved_value=reserved_value-@q WHERE id=@id", c, tx);
             update.Parameters.AddWithValue("q", release); update.Parameters.AddWithValue("id", lot.EntryId); await update.ExecuteNonQueryAsync(ct);
             remain -= release;
         }
         await BumpStockVersion(c, tx, productId, ct);
     }
 
-    private static async Task<List<StockLot>> LockLots(NpgsqlConnection c, NpgsqlTransaction tx, Guid productId, string unit, CancellationToken ct)
+    private static async Task<List<StockLot>> LockLots(SqlConnection c, SqlTransaction tx, Guid productId, string unit, CancellationToken ct)
     {
         var result = new List<StockLot>();
         var unitCode = unit == "EACH" ? (short)0 : (short)1;
-        await using var stock = new NpgsqlCommand("SELECT id FROM inventory.stock_level WHERE product_id=@id FOR UPDATE", c, tx);
+        await using var stock = new SqlCommand("SELECT id FROM inventory.stock_level WHERE product_id=@id FOR UPDATE", c, tx);
         stock.Parameters.AddWithValue("id", productId);
         var stockId = await stock.ExecuteScalarAsync(ct);
         if (stockId is null) throw new InvalidOperationException($"No stock exists for product {productId}.");
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             SELECT le.id,le.on_hand_value,le.reserved_value,l.unit_cost
             FROM inventory.lot_entry le JOIN inventory.lot l ON l.id=le.lot_id
             WHERE le.stock_level_id=@id AND le.on_hand_unit_type=@unit
@@ -605,13 +605,13 @@ public sealed class StorefrontOrderService(NpgsqlDataSource dataSource, IConfigu
         return result;
     }
 
-    private static async Task BumpStockVersion(NpgsqlConnection c, NpgsqlTransaction tx, Guid productId, CancellationToken ct)
+    private static async Task BumpStockVersion(SqlConnection c, SqlTransaction tx, Guid productId, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("UPDATE inventory.stock_level SET version=version+1 WHERE product_id=@id", c, tx);
+        await using var command = new SqlCommand("UPDATE inventory.stock_level SET version=version+1 WHERE product_id=@id", c, tx);
         command.Parameters.AddWithValue("id", productId); await command.ExecuteNonQueryAsync(ct);
     }
 
-    private static OrderHead ReadHead(NpgsqlDataReader r) => new(r.GetGuid(0), r.GetString(1), r.GetGuid(2), r.GetString(3),
+    private static OrderHead ReadHead(SqlDataReader r) => new(r.GetGuid(0), r.GetString(1), r.GetGuid(2), r.GetString(3),
         r.GetDecimal(4), r.GetDecimal(5), r.GetDecimal(6), r.IsDBNull(7) ? null : r.GetString(7),
         AsInstant(r.GetDateTime(8)), r.IsDBNull(9) ? null : AsInstant(r.GetDateTime(9)), AsInstant(r.GetDateTime(10)),
         r.IsDBNull(11) ? null : AsInstant(r.GetDateTime(11)), r.IsDBNull(12) ? null : AsInstant(r.GetDateTime(12)),
@@ -669,3 +669,4 @@ public sealed class OnlineOrderExpiryWorker(IServiceScopeFactory scopeFactory, I
         }
     }
 }
+

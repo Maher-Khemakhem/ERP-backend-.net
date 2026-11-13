@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using Microsoft.Data.SqlClient;
 using SupermarketErp.Api.Features.Auth;
 
@@ -49,13 +49,13 @@ public static class PricingEndpoints
     }
 }
 
-public sealed class PricingRepository(NpgsqlDataSource dataSource)
+public sealed class PricingRepository(SqlServerDataSource dataSource)
 {
     public async Task<IReadOnlyList<PriceView>> ListPrices(CancellationToken ct)
     {
         var prices = new List<PriceView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(
+        await using var command = new SqlCommand(
             "SELECT product_id, unit_price FROM pricing.product_price ORDER BY product_id", connection);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) prices.Add(ToPrice(reader.GetGuid(0), reader.GetDecimal(1)));
@@ -65,7 +65,7 @@ public sealed class PricingRepository(NpgsqlDataSource dataSource)
     public async Task<PriceView?> GetPrice(Guid productId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(
+        await using var command = new SqlCommand(
             "SELECT unit_price FROM pricing.product_price WHERE product_id = @product_id", connection);
         command.Parameters.AddWithValue("product_id", productId);
         var result = await command.ExecuteScalarAsync(ct);
@@ -78,7 +78,7 @@ public sealed class PricingRepository(NpgsqlDataSource dataSource)
         if (request.UnitPrice <= 0) throw new ArgumentException("Unit price must be positive.");
         var amount = decimal.Round(request.UnitPrice, 3, MidpointRounding.AwayFromZero);
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             INSERT INTO pricing.product_price(id, product_id, unit_price)
             VALUES(@id, @product_id, @unit_price)
             ON CONFLICT(product_id) DO UPDATE SET unit_price = EXCLUDED.unit_price
@@ -92,7 +92,7 @@ public sealed class PricingRepository(NpgsqlDataSource dataSource)
     public async Task<bool> DeletePrice(Guid productId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(
+        await using var command = new SqlCommand(
             "DELETE FROM pricing.product_price WHERE product_id = @product_id", connection);
         command.Parameters.AddWithValue("product_id", productId);
         return await command.ExecuteNonQueryAsync(ct) != 0;
@@ -105,7 +105,7 @@ public sealed class PricingRepository(NpgsqlDataSource dataSource)
         if (request.ValidUntil <= request.ValidFrom) throw new ArgumentException("Promotion end must be after its start.");
         var id = Guid.NewGuid();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("""
+        await using var command = new SqlCommand("""
             INSERT INTO pricing.promotion(id, product_id, type, discount_percent, valid_from, valid_until, active)
             VALUES(@id, @product_id, 'PERCENTAGE_DISCOUNT', @discount, @valid_from, @valid_until, 1)
             """, connection);
@@ -128,7 +128,7 @@ public sealed class PricingRepository(NpgsqlDataSource dataSource)
             """;
         var list = new List<PromotionView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(sql, connection);
+        await using var command = new SqlCommand(sql, connection);
         command.Parameters.AddWithValue("product_id", (object?)productId ?? DBNull.Value);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -140,7 +140,7 @@ public sealed class PricingRepository(NpgsqlDataSource dataSource)
     public async Task<bool> DeactivatePromotion(Guid promotionId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(
+        await using var command = new SqlCommand(
             "UPDATE pricing.promotion SET active = 0 WHERE id = @id", connection);
         command.Parameters.AddWithValue("id", promotionId);
         return await command.ExecuteNonQueryAsync(ct) != 0;
@@ -149,6 +149,7 @@ public sealed class PricingRepository(NpgsqlDataSource dataSource)
     private static PriceView ToPrice(Guid productId, decimal amount) =>
         new(productId, $"{amount.ToString("0.000", CultureInfo.InvariantCulture)} TND");
 
-    private static DateTimeOffset ReadInstant(NpgsqlDataReader reader, int ordinal) =>
+    private static DateTimeOffset ReadInstant(SqlDataReader reader, int ordinal) =>
         new(DateTime.SpecifyKind(reader.GetDateTime(ordinal), DateTimeKind.Utc));
 }
+

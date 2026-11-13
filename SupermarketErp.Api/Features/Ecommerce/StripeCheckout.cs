@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Net.Http.Headers;
 using System.Security.Claims;
 using System.Security.Cryptography;
@@ -50,7 +50,7 @@ public static class StripeCheckoutEndpoints
 }
 
 public sealed class StripeCheckoutService(
-    NpgsqlDataSource dataSource,
+    SqlServerDataSource dataSource,
     IHttpClientFactory clients,
     IConfiguration configuration,
     StorefrontOrderService orders)
@@ -116,7 +116,7 @@ public sealed class StripeCheckoutService(
             throw new InvalidOperationException("Stripe returned an invalid test Checkout session.");
 
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var update = new NpgsqlCommand("UPDATE ecommerce.stripe_checkout SET checkout_session_id=@session,checkout_url=@url,status='PENDING',version=version+1 WHERE id=@id AND status='CREATING'", connection);
+        await using var update = new SqlCommand("UPDATE ecommerce.stripe_checkout SET checkout_session_id=@session,checkout_url=@url,status='PENDING',version=version+1 WHERE id=@id AND status='CREATING'", connection);
         update.Parameters.AddWithValue("session", session.Id); update.Parameters.AddWithValue("url", session.Url);
         update.Parameters.AddWithValue("id", checkout.Id);
         await update.ExecuteNonQueryAsync(ct);
@@ -173,12 +173,12 @@ public sealed class StripeCheckoutService(
     private async Task<CheckoutRow> PrepareCheckout(OwnedOrder order, StripeQuote quote, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var tx = (NpgsqlTransaction)await connection.BeginTransactionAsync(ct);
+        await using var tx = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         var existing = await GetCheckoutByOrder(connection, tx, order.Id, ct);
         if (existing?.Status == "EXPIRED") { await tx.CommitAsync(ct); return existing; }
         if (existing is not null) { await tx.CommitAsync(ct); return existing; }
         var row = new CheckoutRow(Guid.NewGuid(), order.Id, null, null, order.Total, quote.AmountCents, quote.Rate, "CREATING");
-        await using (var insert = new NpgsqlCommand("""
+        await using (var insert = new SqlCommand("""
             INSERT INTO ecommerce.stripe_checkout(id,order_id,checkout_session_id,checkout_url,tnd_amount,eur_cents,tnd_to_eur_rate,status,version,created_at)
             VALUES(@id,@order,NULL,NULL,@tnd,@cents,@rate,'CREATING',0,@now)
             """, connection, tx))
@@ -188,7 +188,7 @@ public sealed class StripeCheckoutService(
             insert.Parameters.AddWithValue("rate", row.Rate); insert.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
             await insert.ExecuteNonQueryAsync(ct);
         }
-        await using (var extend = new NpgsqlCommand("UPDATE ecommerce.online_order SET expires_at=GREATEST(expires_at,@deadline),version=version+1 WHERE id=@id AND status='PENDING_PAYMENT'", connection, tx))
+        await using (var extend = new SqlCommand("UPDATE ecommerce.online_order SET expires_at=GREATEST(expires_at,@deadline),version=version+1 WHERE id=@id AND status='PENDING_PAYMENT'", connection, tx))
         {
             extend.Parameters.AddWithValue("deadline", DateTimeOffset.UtcNow.AddMinutes(35)); extend.Parameters.AddWithValue("id", order.Id);
             if (await extend.ExecuteNonQueryAsync(ct) != 1) throw new InvalidOperationException("Order is no longer pending payment.");
@@ -203,9 +203,9 @@ public sealed class StripeCheckoutService(
         return await GetCheckoutByOrder(connection, null, orderId, ct);
     }
 
-    private static async Task<CheckoutRow?> GetCheckoutByOrder(NpgsqlConnection connection, NpgsqlTransaction? tx, Guid orderId, CancellationToken ct)
+    private static async Task<CheckoutRow?> GetCheckoutByOrder(SqlConnection connection, SqlTransaction? tx, Guid orderId, CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand("SELECT id,order_id,checkout_session_id,checkout_url,tnd_amount,eur_cents,tnd_to_eur_rate,status FROM ecommerce.stripe_checkout WHERE order_id=@id", connection, tx);
+        await using var command = new SqlCommand("SELECT id,order_id,checkout_session_id,checkout_url,tnd_amount,eur_cents,tnd_to_eur_rate,status FROM ecommerce.stripe_checkout WHERE order_id=@id", connection, tx);
         command.Parameters.AddWithValue("id", orderId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadCheckout(reader) : null;
@@ -214,7 +214,7 @@ public sealed class StripeCheckoutService(
     private async Task<CheckoutRow?> GetCheckoutBySession(string session, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT id,order_id,checkout_session_id,checkout_url,tnd_amount,eur_cents,tnd_to_eur_rate,status FROM ecommerce.stripe_checkout WHERE checkout_session_id=@id", connection);
+        await using var command = new SqlCommand("SELECT id,order_id,checkout_session_id,checkout_url,tnd_amount,eur_cents,tnd_to_eur_rate,status FROM ecommerce.stripe_checkout WHERE checkout_session_id=@id", connection);
         command.Parameters.AddWithValue("id", session);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadCheckout(reader) : null;
@@ -223,7 +223,7 @@ public sealed class StripeCheckoutService(
     private async Task<bool> CheckoutExists(Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT EXISTS(SELECT 1 FROM ecommerce.stripe_checkout WHERE id=@id)", connection);
+        await using var command = new SqlCommand("SELECT EXISTS(SELECT 1 FROM ecommerce.stripe_checkout WHERE id=@id)", connection);
         command.Parameters.AddWithValue("id", id);
         return (bool)(await command.ExecuteScalarAsync(ct) ?? false);
     }
@@ -231,7 +231,7 @@ public sealed class StripeCheckoutService(
     private async Task<OwnedOrder> ReadOwnedOrder(Guid customerId, Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT id,customer_id,status,total_amount,expires_at FROM ecommerce.online_order WHERE id=@id AND customer_id=@customer", connection);
+        await using var command = new SqlCommand("SELECT id,customer_id,status,total_amount,expires_at FROM ecommerce.online_order WHERE id=@id AND customer_id=@customer", connection);
         command.Parameters.AddWithValue("id", id); command.Parameters.AddWithValue("customer", customerId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) throw new ArgumentException("Order not found.");
@@ -242,7 +242,7 @@ public sealed class StripeCheckoutService(
     private async Task<OwnedOrder> ReadOrderById(Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("SELECT id,customer_id,status,total_amount,expires_at FROM ecommerce.online_order WHERE id=@id", connection);
+        await using var command = new SqlCommand("SELECT id,customer_id,status,total_amount,expires_at FROM ecommerce.online_order WHERE id=@id", connection);
         command.Parameters.AddWithValue("id", id);
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) throw new ArgumentException("Order not found.");
@@ -264,7 +264,7 @@ public sealed class StripeCheckoutService(
     private async Task UpdateCheckoutStatus(Guid id, string status, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand("UPDATE ecommerce.stripe_checkout SET status=@status,version=version+1 WHERE id=@id", connection);
+        await using var command = new SqlCommand("UPDATE ecommerce.stripe_checkout SET status=@status,version=version+1 WHERE id=@id", connection);
         command.Parameters.AddWithValue("status", status); command.Parameters.AddWithValue("id", id);
         await command.ExecuteNonQueryAsync(ct);
     }
@@ -304,7 +304,7 @@ public sealed class StripeCheckoutService(
     }
 
     private static StripeQuote ToQuote(CheckoutRow row) => new("EUR", row.TndAmount, row.AmountCents, row.Rate);
-    private static CheckoutRow ReadCheckout(NpgsqlDataReader r) => new(r.GetGuid(0), r.GetGuid(1),
+    private static CheckoutRow ReadCheckout(SqlDataReader r) => new(r.GetGuid(0), r.GetGuid(1),
         r.IsDBNull(2) ? null : r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3), r.GetDecimal(4),
         r.GetInt64(5), r.GetDecimal(6), r.GetString(7));
     private static StripeSession ReadSession(JsonElement json) => new(
@@ -328,3 +328,4 @@ public sealed class StripeCheckoutService(
     private sealed record StripeSession(string Id, string ClientReferenceId, string Currency, long AmountTotal,
         string PaymentStatus, bool LiveMode, string Status, string Url);
 }
+

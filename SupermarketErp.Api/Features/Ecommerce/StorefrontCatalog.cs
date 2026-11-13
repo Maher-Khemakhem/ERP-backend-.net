@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using Microsoft.Data.SqlClient;
 using SupermarketErp.Api.Features.Auth;
 
@@ -8,7 +8,7 @@ public sealed record StorefrontProductView(Guid Id, string Sku, string Name, Gui
     string? FamilyName, string? FamilyImageUrl, string? ImageUrl, string UnitType, string UnitPrice,
     decimal VatRate, decimal AvailableQuantity, bool InStock);
 
-public sealed class StorefrontCatalog(NpgsqlDataSource dataSource)
+public sealed class StorefrontCatalog(SqlServerDataSource dataSource)
 {
     private const string Select = """
         SELECT p.id,p.sku,p.name,p.family_id,f.name,f.image_url,p.image_url,p.unit_type,
@@ -37,7 +37,7 @@ public sealed class StorefrontCatalog(NpgsqlDataSource dataSource)
         if (search?.Length > 120) throw new ArgumentException("Search cannot exceed 120 characters.");
         var list = new List<StorefrontProductView>();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(Select + " ORDER BY p.name,p.sku", connection);
+        await using var command = new SqlCommand(Select + " ORDER BY p.name,p.sku", connection);
         AddFilters(command, search, familyId);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) list.Add(Read(reader));
@@ -47,25 +47,25 @@ public sealed class StorefrontCatalog(NpgsqlDataSource dataSource)
     public async Task<StorefrontProductView?> Get(Guid id, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new NpgsqlCommand(Select + " AND p.id=@id", connection);
+        await using var command = new SqlCommand(Select + " AND p.id=@id", connection);
         AddFilters(command, null, null);
         command.Parameters.AddWithValue("id", id);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? Read(reader) : null;
     }
 
-    private static void AddFilters(NpgsqlCommand command, string? search, Guid? familyId)
+    private static void AddFilters(SqlCommand command, string? search, Guid? familyId)
     {
         command.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-        command.Parameters.Add(new NpgsqlParameter("family", System.Data.SqlDbType.UniqueIdentifier) { Value = (object?)familyId ?? DBNull.Value });
-        command.Parameters.Add(new NpgsqlParameter("search", System.Data.SqlDbType.NVarChar) { Value = (object?)search ?? DBNull.Value });
-        command.Parameters.Add(new NpgsqlParameter("pattern", System.Data.SqlDbType.NVarChar)
+        command.Parameters.Add(new SqlParameter("family", System.Data.SqlDbType.UniqueIdentifier) { Value = (object?)familyId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("search", System.Data.SqlDbType.NVarChar) { Value = (object?)search ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("pattern", System.Data.SqlDbType.NVarChar)
         {
             Value = (object?)(search is null ? null : $"%{search.Trim()}%") ?? DBNull.Value
         });
     }
 
-    private static StorefrontProductView Read(NpgsqlDataReader r)
+    private static StorefrontProductView Read(SqlDataReader r)
     {
         var price = decimal.Round(r.GetDecimal(8), 3, MidpointRounding.AwayFromZero);
         var available = r.GetDecimal(10);
@@ -88,3 +88,4 @@ public static class StorefrontCatalogEndpoints
         return endpoints;
     }
 }
+
