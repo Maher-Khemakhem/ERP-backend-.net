@@ -41,17 +41,8 @@ app.MapGet("/health/ready", async (SqlServerDataSource db, CancellationToken ct)
     return Results.Ok(new { status = "UP", database = "UP" });
 }).AllowAnonymous();
 
-app.MapAuthEndpoints();
-app.MapProductEndpoints();
-app.MapInventoryEndpoints();
-app.MapProductImages();
-app.MapPricingEndpoints();
+app.MapControllers();
 app.MapProcurementEndpoints();
-app.MapPosEndpoints();
-app.MapFinanceEndpoints();
-app.MapStorefrontCatalog();
-app.MapStorefrontOrderEndpoints();
-app.MapStripeCheckout();
 
 app.Run();
 

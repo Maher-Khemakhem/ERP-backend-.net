@@ -23,6 +23,7 @@ public static class ServiceCollectionExtensions
         IConfiguration configuration,
         IWebHostEnvironment environment)
     {
+        services.AddControllers();
         services.ConfigureHttpJsonOptions(options =>
         {
             options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
@@ -34,19 +35,27 @@ public static class ServiceCollectionExtensions
             options.UseSqlServer(serviceProvider.GetRequiredService<SqlServerDataSource>().ConnectionString));
         services.AddDbContext<BusinessDbContext>((serviceProvider, options) =>
             options.UseSqlServer(serviceProvider.GetRequiredService<SqlServerDataSource>().ConnectionString));
-        services.AddScoped<AuthService>();
-        services.AddScoped<ProductRepository>();
-        services.AddScoped<InventoryRepository>();
-        services.AddSingleton<ProductImageStorage>();
-        services.AddScoped<PricingRepository>();
+        services.AddScoped<IAuthService, AuthService>();
+        services.AddScoped<IProductRepository, ProductRepository>();
+        services.AddScoped<IProductService, ProductService>();
+        services.AddScoped<IInventoryRepository, InventoryRepository>();
+        services.AddScoped<IInventoryService, InventoryService>();
+        services.AddSingleton<IProductImageStorage, ProductImageStorage>();
+        services.AddScoped<IPricingRepository, PricingRepository>();
+        services.AddScoped<IPricingCalculator, PricingService>();
+        services.AddScoped<IPricingManagementService, PricingManagementService>();
         services.AddScoped<ProcurementRepository>();
-        services.AddScoped<PosRepository>();
-        services.AddScoped<FinanceRepository>();
-        services.AddScoped<StorefrontCatalog>();
-        services.AddScoped<StorefrontOrderService>();
-        services.AddScoped<StripeCheckoutService>();
+        services.AddScoped<IFinanceRepository, FinanceRepository>();
+        services.AddScoped<IFinanceService, FinanceService>();
+        services.AddScoped<IPosRepository, PosRepository>();
+        services.AddScoped<IPosService, PosService>();
+        services.AddScoped<InventorySaleService>();
+        services.AddScoped<IStorefrontCatalog, StorefrontCatalog>();
+        services.AddScoped<IStorefrontOrderService, StorefrontOrderService>();
+        services.AddScoped<IStripeCheckoutService, StripeCheckoutService>();
         services.AddHttpClient("stripe", client => client.Timeout = TimeSpan.FromSeconds(20));
-        services.AddSingleton<ScannerPairingService>();
+        services.AddSingleton<ScannerPairingStore>();
+        services.AddScoped<ScannerPairingService>();
         services.AddHostedService<OutboxProcessor>();
         services.AddHostedService<OnlineOrderExpiryWorker>();
 
