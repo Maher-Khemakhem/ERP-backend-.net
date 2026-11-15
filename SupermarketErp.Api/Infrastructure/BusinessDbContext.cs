@@ -3,8 +3,7 @@ using Microsoft.EntityFrameworkCore;
 namespace SupermarketErp.Api.Infrastructure;
 
 /// <summary>
-/// EF model for the business tables.  The database is provisioned by
-/// IdentityDatabaseInitializer; this context deliberately does not own schema creation.
+/// EF model for the business tables. The database schema is managed by the SQL migrations.
 /// </summary>
 public sealed class BusinessDbContext(DbContextOptions<BusinessDbContext> options) : DbContext(options)
 {

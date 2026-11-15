@@ -15,7 +15,9 @@ builder.Services.AddSupermarketErp(builder.Configuration, builder.Environment);
 
 var app = builder.Build();
 var dataSource = app.Services.GetRequiredService<SqlServerDataSource>();
-await IdentityDatabaseInitializer.EnsureCreated(dataSource);
+var appliedMigrations = await DatabaseMigrator.ApplyPendingAsync(dataSource);
+foreach (var migration in appliedMigrations)
+    app.Logger.LogInformation("Applied database migration {Migration}", migration);
 
 app.UseMiddleware<ApiExceptionMiddleware>();
 app.Use(async (context, next) =>
@@ -27,6 +29,13 @@ app.Use(async (context, next) =>
 });
 app.UseCors("java-compatible");
 app.UseAuthentication();
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwaggerUI(options =>
+    {
+        options.SwaggerEndpoint("/openapi/v1.json", "Supermarket ERP API");
+    });
+}
 app.UseAuthorization();
 
 if (app.Environment.IsDevelopment())
