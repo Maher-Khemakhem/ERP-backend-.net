@@ -67,6 +67,12 @@ public sealed class AuthService(
         return user is null ? null : ToRecord(user).ToView();
     }
 
+    public async Task<UserView?> FindById(Guid userId, CancellationToken ct)
+    {
+        var user = await db.Users.AsNoTracking().Include(x => x.Roles).SingleOrDefaultAsync(x => x.Id == userId, ct);
+        return user is null ? null : ToRecord(user).ToView();
+    }
+
     public async Task<IReadOnlyList<UserView>> ListUsers(CancellationToken ct) =>
         (await db.Users.AsNoTracking().Include(x => x.Roles).OrderBy(x => x.Username).ToListAsync(ct))
         .Select(user => ToRecord(user).ToView())

@@ -4,7 +4,7 @@ using SupermarketErp.Api.Infrastructure;
 
 namespace SupermarketErp.Api.Features.Inventory;
 
-public sealed class InventoryRepository(BusinessDbContext db) : IInventoryRepository
+public sealed class InventoryRepository(BusinessDbContext db, IInventoryStock inventoryStock) : IInventoryRepository
 {
     public async Task<IReadOnlyList<FamilyView>> ListFamilies(CancellationToken ct)
     {
@@ -64,41 +64,10 @@ public sealed class InventoryRepository(BusinessDbContext db) : IInventoryReposi
 
     public async Task ReceiveStock(ReceiveStockRequest request, CancellationToken ct)
     {
-        if (request.QuantityValue <= 0) throw new ArgumentException("Quantity must be positive.");
-        if (request.UnitCost is < 0) throw new ArgumentException("Unit cost cannot be negative.");
-        var unitType = request.UnitType?.Trim().ToUpperInvariant();
-        if (unitType is not ("EACH" or "WEIGHT")) throw new ArgumentException("Unit type must be EACH or WEIGHT.");
-        if (unitType == "EACH" && request.QuantityValue != decimal.Truncate(request.QuantityValue))
-            throw new ArgumentException("EACH quantities must be whole numbers.");
-        var quantityValue = unitType == "WEIGHT"
-            ? decimal.Round(request.QuantityValue, 3, MidpointRounding.AwayFromZero)
-            : request.QuantityValue;
-
         await using var transaction = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
-        var product = await db.Products.SingleOrDefaultAsync(x => x.Id == request.ProductId, ct)
-            ?? throw new ArgumentException($"Product not found: {request.ProductId}");
-        if (!product.UnitType.Equals(unitType, StringComparison.Ordinal))
-            throw new ArgumentException("Requested unit type does not match the product.");
-        if (product.Perishable && request.ExpiryDate is null)
-            throw new ArgumentException("Perishable products require an expiry date.");
-
-        var stock = await db.StockLevels.SingleOrDefaultAsync(x => x.ProductId == request.ProductId, ct);
-        if (stock is null)
-        {
-            stock = new StockLevelEntity { Id = Guid.NewGuid(), ProductId = request.ProductId, Version = 0 };
-            db.StockLevels.Add(stock);
-        }
-        else stock.Version++;
-        var lotNumber = string.IsNullOrWhiteSpace(request.LotNumber)
-            ? $"LOT-{Guid.NewGuid().ToString("N")[..8].ToUpperInvariant()}"
-            : request.LotNumber.Trim();
-        var lot = new LotEntity { Id = Guid.NewGuid(), LotNumber = lotNumber, ProductId = request.ProductId,
-            ExpiryDate = request.ExpiryDate, ReceivedDate = request.ReceivedDate ?? DateOnly.FromDateTime(DateTime.Today),
-            SupplierReference = Normalize(request.SupplierReference), UnitCost = request.UnitCost ?? 0m };
-        db.Lots.Add(lot);
-        db.LotEntries.Add(new LotEntryEntity { Id = Guid.NewGuid(), StockLevelId = stock.Id, LotId = lot.Id,
-            OnHandValue = quantityValue, OnHandUnitType = Unit(unitType), ReservedValue = 0, ReservedUnitType = Unit(unitType) });
-        await db.SaveChangesAsync(ct);
+        await inventoryStock.ReceiveLot(new LotReceipt(request.ProductId, request.LotNumber, request.QuantityValue,
+            request.UnitType ?? "", request.ExpiryDate, request.ReceivedDate, request.SupplierReference,
+            request.UnitCost ?? 0m), ct);
         await transaction.CommitAsync(ct);
     }
 
@@ -115,7 +84,6 @@ public sealed class InventoryRepository(BusinessDbContext db) : IInventoryReposi
             .ToListAsync(ct);
     }
 
-    private static short Unit(string unit) => unit == "EACH" ? (short)0 : (short)1;
     private static string? Normalize(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }
 

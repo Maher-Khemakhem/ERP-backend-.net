@@ -1,11 +1,11 @@
 using System.Security.Cryptography;
-using Microsoft.EntityFrameworkCore;
+using SupermarketErp.Api.Features.Inventory;
 using SupermarketErp.Api.Infrastructure;
 
 namespace SupermarketErp.Api.Features.Pos;
 
 public sealed class ScannerPairingService(
-    BusinessDbContext db,
+    IInventoryStock inventory,
     IPosService pos,
     ScannerPairingStore store)
 {
@@ -41,8 +41,7 @@ public sealed class ScannerPairingService(
             throw new InvalidOperationException("Only an in-progress ticket can use the phone scanner.");
 
         var barcode = rawBarcode?.Trim() ?? "";
-        var product = await db.Products.AsNoTracking()
-            .SingleOrDefaultAsync(x => x.Sku.ToLower() == barcode.ToLower(), ct)
+        var product = await inventory.FindProductBySku(barcode, ct)
             ?? throw new ArgumentException($"No product found for barcode: {barcode}");
 
         var quantity = product.UnitType == "WEIGHT" ? 0.1m : 1m;

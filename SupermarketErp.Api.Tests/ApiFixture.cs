@@ -58,6 +58,7 @@ public sealed class ApiFixture : IAsyncLifetime
         Override("DB_CONNECTION_STRING", ConnectionString);
         Override("JWT_SECRET", "integration-tests-only-secret-0123456789abcdef");
         Override("APP_UPLOAD_DIR", _uploadDirectory);
+        Override("ECOMMERCE_EXPIRY_SCAN_INTERVAL_MS", "300"); // let the expiry worker run quickly in tests
 
         _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder => builder.UseEnvironment("Testing"));
         Client = _factory.CreateClient();
@@ -100,6 +101,19 @@ public sealed class ApiFixture : IAsyncLifetime
 
         try { if (Directory.Exists(_uploadDirectory)) Directory.Delete(_uploadDirectory, recursive: true); }
         catch (IOException) { }
+    }
+
+    /// <summary>Registers a storefront customer and returns a client authenticated as them.</summary>
+    public async Task<(HttpClient Client, string Username)> RegisterCustomer()
+    {
+        var username = "cust" + Guid.NewGuid().ToString("N")[..10];
+        var anonymous = _factory!.CreateClient();
+        var response = await anonymous.PostAsJsonAsync("/api/store/auth/register",
+            new { username, displayName = "Customer " + username, password = "Str0ng-Test-Passw0rd!" });
+        response.EnsureSuccessStatusCode();
+        var token = (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("token").GetString();
+        anonymous.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        return (anonymous, username);
     }
 
     public async Task<T> ScalarAsync<T>(string sql, params (string Name, object Value)[] parameters)

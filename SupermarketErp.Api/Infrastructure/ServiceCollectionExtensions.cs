@@ -49,7 +49,7 @@ public static class ServiceCollectionExtensions
         services.AddScoped<IFinanceService, FinanceService>();
         services.AddScoped<IPosRepository, PosRepository>();
         services.AddScoped<IPosService, PosService>();
-        services.AddScoped<InventorySaleService>();
+        services.AddScoped<IInventoryStock, InventoryStock>();
         services.AddScoped<IStorefrontCatalog, StorefrontCatalog>();
         services.AddScoped<IStorefrontOrderService, StorefrontOrderService>();
         services.AddScoped<IStripeCheckoutService, StripeCheckoutService>();

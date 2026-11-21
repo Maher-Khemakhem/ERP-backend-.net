@@ -1,6 +1,7 @@
 using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 using SupermarketErp.Api.Features.Auth;
+using SupermarketErp.Api.Features.Inventory;
 using SupermarketErp.Api.Features.Pricing;
 using SupermarketErp.Api.Infrastructure;
 
@@ -9,7 +10,7 @@ namespace SupermarketErp.Api.Features.Pos;
 public sealed class PosRepository(
     BusinessDbContext db,
     IPricingCalculator pricing,
-    InventorySaleService inventory) : IPosRepository
+    IInventoryStock inventory) : IPosRepository
 {
     public async Task<IReadOnlyList<TillView>> ListTills(CancellationToken ct)
     {
@@ -73,7 +74,7 @@ public sealed class PosRepository(
 
     public async Task Complete(Guid id,CompleteTransactionRequest request,CancellationToken ct)
     {
-        var method=request.PaymentMethod.Trim().ToUpperInvariant();if(method is not("CASH" or "CARD"))throw new ArgumentException("Payment method must be CASH or CARD.");await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);var t=await db.PosTransactions.SingleOrDefaultAsync(x=>x.Id==id&&x.Status=="IN_PROGRESS",ct)??throw new InvalidOperationException("Only in-progress tickets can be completed.");await RequireOpenSession(t.CashSessionId,ct);var lines=await db.TransactionLines.Where(x=>x.TransactionId==id).ToListAsync(ct);var total=lines.Sum(x=>x.LineTotal);if(request.AmountReceived is decimal tender&&((method=="CASH"&&tender<total)||(method=="CARD"&&tender!=total)))throw new ArgumentException(method=="CASH"?"Cash received is less than the transaction total.":"Card amount must equal the transaction total.");decimal cogs=0;foreach(var line in lines)cogs+=await inventory.Sell(line.ProductId,line.Quantity,line.UnitType,ct);var net=lines.Sum(x=>x.LineTotal-x.VatAmount);var vat=lines.Sum(x=>x.VatAmount);t.Status="COMPLETED";t.PaymentMethod=method;t.CompletedAt=DateTimeOffset.UtcNow;t.Version++;if(method=="CASH"){var s=await db.CashSessions.SingleAsync(x=>x.Id==t.CashSessionId,ct);s.ExpectedCash+=total;s.Version++;}await db.SaveChangesAsync(ct);await OutboxWriter.Write(db,"SaleCompleted",new SaleCompletedEvent(id,t.CashSessionId,method,net,vat,total,cogs),ct);await tx.CommitAsync(ct);
+        var method=request.PaymentMethod.Trim().ToUpperInvariant();if(method is not("CASH" or "CARD"))throw new ArgumentException("Payment method must be CASH or CARD.");await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);var t=await db.PosTransactions.SingleOrDefaultAsync(x=>x.Id==id&&x.Status=="IN_PROGRESS",ct)??throw new InvalidOperationException("Only in-progress tickets can be completed.");await RequireOpenSession(t.CashSessionId,ct);var lines=await db.TransactionLines.Where(x=>x.TransactionId==id).ToListAsync(ct);var total=lines.Sum(x=>x.LineTotal);if(request.AmountReceived is decimal tender&&((method=="CASH"&&tender<total)||(method=="CARD"&&tender!=total)))throw new ArgumentException(method=="CASH"?"Cash received is less than the transaction total.":"Card amount must equal the transaction total.");decimal cogs=0;foreach(var line in lines)cogs+=await inventory.Sell(line.ProductId,line.Quantity,line.UnitType==0?"EACH":"WEIGHT",ct);var net=lines.Sum(x=>x.LineTotal-x.VatAmount);var vat=lines.Sum(x=>x.VatAmount);t.Status="COMPLETED";t.PaymentMethod=method;t.CompletedAt=DateTimeOffset.UtcNow;t.Version++;if(method=="CASH"){var s=await db.CashSessions.SingleAsync(x=>x.Id==t.CashSessionId,ct);s.ExpectedCash+=total;s.Version++;}await db.SaveChangesAsync(ct);await OutboxWriter.Write(db,"SaleCompleted",new SaleCompletedEvent(id,t.CashSessionId,method,net,vat,total,cogs),ct);await tx.CommitAsync(ct);
     }
 
     public async Task<bool> Void(Guid id,VoidTransactionRequest request,CancellationToken ct){await using var tx=await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable,ct);var t=await db.PosTransactions.SingleOrDefaultAsync(x=>x.Id==id,ct)??throw new ArgumentException($"Ticket not found: {id}");if(t.Status!="IN_PROGRESS")throw new InvalidOperationException("Only in-progress tickets can be changed.");await RequireOpenSession(t.CashSessionId,ct);t.Status="VOIDED";t.Version++;await db.SaveChangesAsync(ct);await tx.CommitAsync(ct);return true;}

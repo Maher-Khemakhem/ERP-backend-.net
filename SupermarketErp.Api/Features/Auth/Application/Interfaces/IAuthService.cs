@@ -7,6 +7,7 @@ public interface IAuthService
     Task<AuthResponse> RegisterCustomer(RegisterRequest request, CancellationToken ct);
     Task<AuthResponse> Login(LoginRequest request, bool customerOnly, CancellationToken ct);
     Task<UserView?> FindByUsername(string username, CancellationToken ct);
+    Task<UserView?> FindById(Guid userId, CancellationToken ct);
     Task<IReadOnlyList<UserView>> ListUsers(CancellationToken ct);
     Task<UserView> CreateManagedUser(CreateUserRequest request, CancellationToken ct);
     Task<UserView> UpdateRoles(Guid userId, HashSet<string> roles, CancellationToken ct);

@@ -38,6 +38,25 @@ public sealed class ReceiptFlowTests(ApiFixture fixture) : IClassFixture<ApiFixt
     }
 
     [Fact]
+    public async Task An_order_may_list_the_same_product_on_two_lines_and_both_become_lots()
+    {
+        var product = await Api.CreateProduct();
+        var order = await Api.CreateOrder(await Api.CreateSupplier(), (product, 5m, 2m), (product, 3m, 2.5m));
+        await Api.PlaceOrder(order);
+        var lines = (await Api.Order(order)).GetProperty("lines").EnumerateArray()
+            .Select(l => (Id: l.GetProperty("id").GetGuid(), Quantity: decimal.Parse(l.GetProperty("quantity").GetString()!)))
+            .ToArray();
+
+        var (status, body) = await Api.Receive(order, lines.Select(l => ErpApi.ReceiptLine(l.Id, l.Quantity)).ToArray());
+
+        Assert.True(status == HttpStatusCode.OK, body.ToString());
+        var stock = await Api.Stock(product);
+        Assert.Equal(8m, stock.GetProperty("availableQuantity").GetDecimal());
+        Assert.Equal(2, stock.GetProperty("lots").GetArrayLength());
+        Assert.Equal(1, await StockLevels(product)); // one stock level per product
+    }
+
+    [Fact]
     public async Task A_draft_order_cannot_be_received()
     {
         var product = await Api.CreateProduct();
