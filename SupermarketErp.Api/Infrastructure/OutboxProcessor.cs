@@ -3,8 +3,20 @@ using Microsoft.Data.SqlClient;
 
 namespace SupermarketErp.Api.Infrastructure;
 
+/// <summary>
+/// Delivers outbox events at least once, in order. A failing event is retried with exponential backoff
+/// (2s, 4s, 8s, ...) without holding up the events behind it, and is dead-lettered (<c>failed_at</c> set)
+/// after <see cref="MaxAttempts"/> failures, or at once when it can never succeed (unknown type, bad payload).
+/// Handlers must therefore be idempotent.
+/// </summary>
 public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<OutboxProcessor> logger) : BackgroundService
 {
+    public const int MaxAttempts = 5;
+    private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(1);
+
+    /// <summary>An event that can never be handled, so retrying it is pointless.</summary>
+    private sealed class PermanentOutboxException(string message) : Exception(message);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -31,19 +43,23 @@ public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<Outb
         Guid id;
         string type;
         string payload;
+        int attempts;
         await using var connection = await dataSource.OpenConnectionAsync(ct);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
         await using (var select = new SqlCommand("""
-            SELECT TOP (1) id,event_type,payload FROM platform.dotnet_outbox WITH (UPDLOCK, READPAST, ROWLOCK)
-            WHERE processed_at IS NULL
+            SELECT TOP (1) id,event_type,payload,attempts FROM platform.dotnet_outbox WITH (UPDLOCK, READPAST, ROWLOCK)
+            WHERE processed_at IS NULL AND failed_at IS NULL
+              AND (next_attempt_at IS NULL OR next_attempt_at <= @now)
             ORDER BY occurred_at,id
             """, connection, transaction))
         {
+            select.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
             await using var reader = await select.ExecuteReaderAsync(ct);
             if (!await reader.ReadAsync(ct)) return false;
             id = reader.GetGuid(0);
             type = reader.GetString(1);
             payload = reader.GetString(2);
+            attempts = reader.GetInt32(3);
         }
 
         try
@@ -66,7 +82,7 @@ public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<Outb
                     await CreateLowStockAlert(connection, transaction, JsonSerializer.Deserialize<Guid>(payload), ct);
                     break;
                 default:
-                    throw new InvalidOperationException($"Unknown outbox event type '{type}'.");
+                    throw new PermanentOutboxException($"Unknown outbox event type '{type}'.");
             }
 
             await using var mark = new SqlCommand(
@@ -77,25 +93,48 @@ public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<Outb
             await transaction.CommitAsync(ct);
             return true;
         }
-        catch (Exception exception)
+        catch (Exception exception) when (!ct.IsCancellationRequested)
         {
             await transaction.RollbackAsync(ct);
-            await RecordFailure(id, exception, ct);
+            var permanent = exception is PermanentOutboxException or JsonException;
+            await RecordFailure(id, type, attempts, permanent, exception, ct);
             return true;
         }
     }
 
-    private async Task RecordFailure(Guid id, Exception exception, CancellationToken ct)
+    /// <summary>
+    /// Records the failure and schedules the retry. The row is deferred (or dead-lettered), so the next poll
+    /// moves on to the events behind it instead of hammering the failing one.
+    /// </summary>
+    private async Task RecordFailure(Guid id, string type, int attempts, bool permanent, Exception exception, CancellationToken ct)
     {
-        logger.LogError(exception, "Failed to process outbox event {OutboxId}", id);
+        var failedAttempts = attempts + 1;
+        var deadLetter = permanent || failedAttempts >= MaxAttempts;
+        var now = DateTimeOffset.UtcNow;
+        var backoff = TimeSpan.FromSeconds(Math.Min(Math.Pow(2, failedAttempts), MaxBackoff.TotalSeconds));
+
+        if (deadLetter)
+            logger.LogCritical(exception, "Outbox event {OutboxId} ({EventType}) dead-lettered after {Attempts} attempt(s); " +
+                "it will not be retried until failed_at is cleared", id, type, failedAttempts);
+        else
+            logger.LogError(exception, "Outbox event {OutboxId} ({EventType}) failed (attempt {Attempts}/{Max}); retrying in {Backoff}s",
+                id, type, failedAttempts, MaxAttempts, backoff.TotalSeconds);
+
         await using var connection = await dataSource.OpenConnectionAsync(ct);
         await using var command = new SqlCommand("""
-            UPDATE platform.dotnet_outbox SET attempts=attempts+1,last_error=@error WHERE id=@id
+            UPDATE platform.dotnet_outbox
+            SET attempts=@attempts, last_error=@error,
+                failed_at=CASE WHEN @dead=1 THEN @now ELSE NULL END,
+                next_attempt_at=CASE WHEN @dead=1 THEN NULL ELSE @next END
+            WHERE id=@id
             """, connection);
+        command.Parameters.AddWithValue("attempts", failedAttempts);
         command.Parameters.AddWithValue("error", exception.Message.Length > 4000 ? exception.Message[..4000] : exception.Message);
+        command.Parameters.AddWithValue("dead", deadLetter);
+        command.Parameters.AddWithValue("now", now);
+        command.Parameters.AddWithValue("next", now + backoff);
         command.Parameters.AddWithValue("id", id);
         await command.ExecuteNonQueryAsync(ct);
-        await Task.Delay(TimeSpan.FromSeconds(2), ct);
     }
 
     private static Task PostSale(SqlConnection c, SqlTransaction tx, SaleCompletedEvent e, CancellationToken ct) =>
@@ -146,9 +185,12 @@ public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<Outb
 
     private static async Task CreateLowStockAlert(SqlConnection c, SqlTransaction tx, Guid productId, CancellationToken ct)
     {
+        // Idempotent: one open alert per product. The unique index ux_low_stock_alert_open_product backs this up,
+        // and if two deliveries ever raced, the loser fails once and is skipped by this check on retry.
         await using var command = new SqlCommand("""
-            INSERT INTO procurement.low_stock_alert(id,product_id,raised_at,acknowledged)
-            VALUES(@id,@product,@now,0)
+            IF NOT EXISTS (SELECT 1 FROM procurement.low_stock_alert WHERE product_id=@product AND acknowledged=0)
+                INSERT INTO procurement.low_stock_alert(id,product_id,raised_at,acknowledged)
+                VALUES(@id,@product,@now,0)
             """, c, tx);
         command.Parameters.AddWithValue("id", Guid.NewGuid());
         command.Parameters.AddWithValue("product", productId);

@@ -44,6 +44,9 @@ public sealed class InventorySaleService(BusinessDbContext db)
         }
 
         stock.Version++;
+        // Flush first: EF queries do not see unsaved changes, so without this the totals below would
+        // describe the stock from before this sale and the low-stock check would lag one sale behind.
+        await db.SaveChangesAsync(ct);
         var onHand = await db.LotEntries
             .Where(x => x.StockLevelId == stock.Id)
             .Select(x => (x.OnHandValue ?? 0m) - (x.ReservedValue ?? 0m))
@@ -52,10 +55,7 @@ public sealed class InventorySaleService(BusinessDbContext db)
             .SingleAsync(x => x.Id == productId, ct);
 
         if (onHand <= product.ReorderPoint)
-        {
-            await db.SaveChangesAsync(ct);
             await OutboxWriter.Write(db, "LowStockThresholdReached", productId, ct);
-        }
 
         return cost;
     }
