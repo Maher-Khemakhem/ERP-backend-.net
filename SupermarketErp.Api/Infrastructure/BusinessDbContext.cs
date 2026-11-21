@@ -1,4 +1,9 @@
 using Microsoft.EntityFrameworkCore;
+using SupermarketErp.Api.Features.Ecommerce;
+using SupermarketErp.Api.Features.Finance;
+using SupermarketErp.Api.Features.Inventory;
+using SupermarketErp.Api.Features.Pos;
+using SupermarketErp.Api.Features.Procurement;
 
 namespace SupermarketErp.Api.Infrastructure;
 
@@ -172,21 +177,6 @@ public sealed class BusinessDbContext(DbContextOptions<BusinessDbContext> option
     }
 }
 
-public sealed class ProductEntity
-{
-    public Guid Id { get; set; }
-    public string Sku { get; set; } = "";
-    public string Name { get; set; } = "";
-    public Guid? FamilyId { get; set; }
-    public ProductFamilyEntity? Family { get; set; }
-    public string? ImageUrl { get; set; }
-    public string UnitType { get; set; } = "";
-    public bool Perishable { get; set; }
-    public int? ReorderPoint { get; set; }
-    public decimal? VatRate { get; set; }
-    public bool OnlineVisible { get; set; }
-}
-public sealed class ProductFamilyEntity { public Guid Id { get; set; } public string Name { get; set; } = ""; public string? ImageUrl { get; set; } }
 public sealed class ProductPriceEntity { public Guid Id { get; set; } public Guid ProductId { get; set; } public decimal? UnitPrice { get; set; } }
 public sealed class PromotionEntity
 {
@@ -210,23 +200,6 @@ public sealed class LotEntryEntity
     public short? ReservedUnitType { get; set; }
 }
 public sealed class LotEntity { public Guid Id { get; set; } public string LotNumber { get; set; } = ""; public Guid ProductId { get; set; } public DateOnly? ExpiryDate { get; set; } public DateOnly ReceivedDate { get; set; } public string? SupplierReference { get; set; } public decimal UnitCost { get; set; } }
-public sealed class SupplierEntity { public Guid Id { get; set; } public string Name { get; set; } = ""; public string? ContactEmail { get; set; } public string? ContactPhone { get; set; } public string? Address { get; set; } }
-public sealed class PurchaseOrderEntity { public Guid Id { get; set; } public Guid SupplierId { get; set; } public string Status { get; set; } = ""; public DateTimeOffset PlacedAt { get; set; } public List<PurchaseOrderLineEntity> Lines { get; set; } = []; }
-public sealed class PurchaseOrderLineEntity { public Guid Id { get; set; } public Guid PurchaseOrderId { get; set; } public Guid ProductId { get; set; } public decimal Quantity { get; set; } public short UnitType { get; set; } public decimal UnitCost { get; set; } }
-public sealed class LowStockAlertEntity { public Guid Id { get; set; } public Guid ProductId { get; set; } public DateTimeOffset RaisedAt { get; set; } public bool Acknowledged { get; set; } }
-public sealed class JournalEntryEntity { public Guid Id { get; set; } public string EventKey { get; set; } = ""; public string Description { get; set; } = ""; public Guid? ReferenceId { get; set; } public DateTimeOffset PostedAt { get; set; } public List<JournalLineEntity> Lines { get; set; } = []; }
-public sealed class JournalLineEntity { public Guid Id { get; set; } public Guid JournalEntryId { get; set; } public string AccountCode { get; set; } = ""; public decimal DebitAmount { get; set; } public decimal CreditAmount { get; set; } public string Description { get; set; } = ""; }
-public sealed class LedgerEntryEntity { public Guid Id { get; set; } public string Type { get; set; } = ""; public decimal Amount { get; set; } public string Description { get; set; } = ""; public Guid? ReferenceId { get; set; } public DateTimeOffset RecordedAt { get; set; } }
-public sealed class SupplierInvoiceEntity { public Guid Id { get; set; } public Guid SupplierId { get; set; } public Guid? PurchaseOrderId { get; set; } public string InvoiceNumber { get; set; } = ""; public decimal Subtotal { get; set; } public decimal TaxAmount { get; set; } public decimal TotalAmount { get; set; } public decimal PaidAmount { get; set; } public string Status { get; set; } = ""; public DateOnly IssueDate { get; set; } public DateOnly? DueDate { get; set; } public DateTimeOffset CreatedAt { get; set; } public long Version { get; set; } }
-public sealed class SupplierPaymentEntity { public Guid Id { get; set; } public string PaymentReference { get; set; } = ""; public Guid InvoiceId { get; set; } public decimal Amount { get; set; } public string PaymentMethod { get; set; } = ""; public DateOnly PaidDate { get; set; } }
 public sealed class DotnetOutboxEntity { public Guid Id { get; set; } public string EventType { get; set; } = ""; public string Payload { get; set; } = ""; public DateTimeOffset OccurredAt { get; set; } }
-public sealed class TillEntity { public Guid Id { get; set; } public string TillNumber { get; set; } = ""; public string Status { get; set; } = ""; public long Version { get; set; } }
-public sealed class CashSessionEntity { public Guid Id { get; set; } public Guid TillId { get; set; } public string CashierName { get; set; } = ""; public decimal OpeningFloat { get; set; } public decimal ExpectedCash { get; set; } public decimal? CountedCash { get; set; } public string Status { get; set; } = ""; public DateTimeOffset OpenedAt { get; set; } public DateTimeOffset? ClosedAt { get; set; } public long Version { get; set; } }
-public sealed class PosTransactionEntity { public Guid Id { get; set; } public Guid CashSessionId { get; set; } public string Status { get; set; } = ""; public string? PaymentMethod { get; set; } public DateTimeOffset StartedAt { get; set; } public DateTimeOffset? CompletedAt { get; set; } public long Version { get; set; } public List<TransactionLineEntity> Lines { get; set; } = []; }
-public sealed class TransactionLineEntity { public Guid Id { get; set; } public Guid TransactionId { get; set; } public Guid ProductId { get; set; } public decimal Quantity { get; set; } public short UnitType { get; set; } public decimal LineTotal { get; set; } public decimal VatAmount { get; set; } }
-public sealed class CartEntity { public Guid Id { get; set; } public Guid CustomerId { get; set; } public long Version { get; set; } public DateTimeOffset CreatedAt { get; set; } public DateTimeOffset UpdatedAt { get; set; } }
-public sealed class CartItemEntity { public Guid Id { get; set; } public Guid CartId { get; set; } public Guid ProductId { get; set; } public decimal Quantity { get; set; } public string UnitType { get; set; } = ""; }
-public sealed class OnlineOrderEntity { public Guid Id { get; set; } public string OrderNumber { get; set; } = ""; public Guid CustomerId { get; set; } public string Status { get; set; } = ""; public decimal NetAmount { get; set; } public decimal VatAmount { get; set; } public decimal TotalAmount { get; set; } public string? PaymentReference { get; set; } public DateTimeOffset CreatedAt { get; set; } public DateTimeOffset? ConfirmedAt { get; set; } public long Version { get; set; } public DateTimeOffset ExpiresAt { get; set; } public DateTimeOffset? CancelledAt { get; set; } public DateTimeOffset? ExpiredAt { get; set; } public string? PickupCode { get; set; } public DateTimeOffset? PickedUpAt { get; set; } public string? PickedUpBy { get; set; } public List<OnlineOrderLineEntity> Lines { get; set; } = []; }
-public sealed class OnlineOrderLineEntity { public Guid Id { get; set; } public Guid OrderId { get; set; } public Guid ProductId { get; set; } public string ProductName { get; set; } = ""; public decimal Quantity { get; set; } public string UnitType { get; set; } = ""; public decimal UnitPrice { get; set; } public decimal LineTotal { get; set; } public decimal VatAmount { get; set; } }
 public sealed class StripeCheckoutEntity { public Guid Id { get; set; } public Guid OrderId { get; set; } public string? SessionId { get; set; } public string? Url { get; set; } public decimal TndAmount { get; set; } public long AmountCents { get; set; } public decimal Rate { get; set; } public string Status { get; set; } = ""; public long Version { get; set; } public DateTimeOffset CreatedAt { get; set; } }
 public sealed class AppUserEntity { public Guid Id { get; set; } public string Username { get; set; } = ""; public string DisplayName { get; set; } = ""; }

@@ -44,13 +44,17 @@ public static class ServiceCollectionExtensions
         services.AddScoped<IPricingRepository, PricingRepository>();
         services.AddScoped<IPricingCalculator, PricingService>();
         services.AddScoped<IPricingManagementService, PricingManagementService>();
-        services.AddScoped<ProcurementRepository>();
+        services.AddScoped<IProcurementRepository, ProcurementRepository>();
+        services.AddScoped<IProcurementService, ProcurementService>();
         services.AddScoped<IFinanceRepository, FinanceRepository>();
         services.AddScoped<IFinanceService, FinanceService>();
+        services.AddScoped<IUnitOfWork, UnitOfWork>();
+        services.AddScoped<IEventOutbox, EventOutbox>();
         services.AddScoped<IPosRepository, PosRepository>();
         services.AddScoped<IPosService, PosService>();
         services.AddScoped<IInventoryStock, InventoryStock>();
         services.AddScoped<IStorefrontCatalog, StorefrontCatalog>();
+        services.AddScoped<IStorefrontRepository, StorefrontRepository>();
         services.AddScoped<IStorefrontOrderService, StorefrontOrderService>();
         services.AddScoped<IStripeCheckoutService, StripeCheckoutService>();
         services.AddHttpClient("stripe", client => client.Timeout = TimeSpan.FromSeconds(20));

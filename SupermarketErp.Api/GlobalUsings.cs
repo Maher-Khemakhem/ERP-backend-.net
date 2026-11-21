@@ -5,3 +5,4 @@ global using SqlParameter = Microsoft.Data.SqlClient.SqlParameter;
 global using SqlTransaction = Microsoft.Data.SqlClient.SqlTransaction;
 global using SqlServerDataSource = SupermarketErp.Api.Infrastructure.SqlServerDataSource;
 
+global using SupermarketErp.Api.Shared;

@@ -44,16 +44,6 @@ public sealed class InventoryController(IInventoryService service) : ControllerB
     [Authorize(Policy = Policies.InventoryWrite)]
     public async Task<IActionResult> CreateFamily(
         [FromBody] CreateFamilyRequest request,
-        CancellationToken ct)
-    {
-        try
-        {
-            var id = await service.CreateFamily(request, ct);
-            return Ok(new { familyId = id });
-        }
-        catch (InvalidOperationException)
-        {
-            return Conflict();
-        }
-    }
+        CancellationToken ct) =>
+        Ok(new { familyId = await service.CreateFamily(request, ct) });
 }

@@ -46,7 +46,7 @@ public sealed class LoginRateLimiter
     private static int Positive(IConfiguration configuration, string key, int fallback) =>
         int.TryParse(configuration[key], out var value) && value > 0
             ? value
-            : configuration[key] is null ? fallback : throw new InvalidOperationException($"{key} must be positive.");
+            : configuration[key] is null ? fallback : throw new ConflictException($"{key} must be positive.");
 
     private static TimeSpan Seconds(IConfiguration configuration, string key, int fallback)
     {

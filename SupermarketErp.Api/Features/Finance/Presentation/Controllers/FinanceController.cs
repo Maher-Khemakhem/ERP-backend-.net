@@ -45,7 +45,7 @@ public sealed class FinanceController(IFinanceService service) : ControllerBase
     {
         var invoice = await service.PayInvoice(invoiceId, request, ct);
         return invoice is null
-            ? throw new ArgumentException($"Supplier invoice not found: {invoiceId}")
+            ? throw new DomainValidationException($"Supplier invoice not found: {invoiceId}")
             : Ok(invoice);
     }
 

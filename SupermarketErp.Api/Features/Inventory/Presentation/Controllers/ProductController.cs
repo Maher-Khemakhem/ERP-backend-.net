@@ -1,6 +1,5 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Data.SqlClient;
 using SupermarketErp.Api.Features.Auth;
 
 namespace SupermarketErp.Api.Features.Inventory;
@@ -31,15 +30,7 @@ public sealed class ProductController(IProductService service) : ControllerBase
 
     [HttpDelete("{productId:guid}")]
     [Authorize(Policy = Policies.InventoryWrite)]
-    public async Task<IActionResult> Delete(Guid productId, CancellationToken ct)
-    {
-        try
-        {
-            return await service.Delete(productId, ct) ? NoContent() : NotFound();
-        }
-        catch (SqlException ex) when (ex.Number == 547)
-        {
-            return Conflict();
-        }
-    }
+    public async Task<IActionResult> Delete(Guid productId, CancellationToken ct) =>
+        // A product that stock or orders still refer to is refused as a conflict by the API error middleware.
+        await service.Delete(productId, ct) ? NoContent() : NotFound();
 }

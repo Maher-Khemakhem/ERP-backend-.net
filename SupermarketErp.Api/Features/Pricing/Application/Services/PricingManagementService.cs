@@ -20,9 +20,9 @@ public sealed class PricingManagementService(IPricingRepository repository)
     public Task SetPrice(SetPriceRequest request, CancellationToken ct)
     {
         if (request.ProductId == Guid.Empty)
-            throw new ArgumentException("Product ID is required.");
+            throw new DomainValidationException("Product ID is required.");
         if (request.UnitPrice <= 0)
-            throw new ArgumentException("Unit price must be positive.");
+            throw new DomainValidationException("Unit price must be positive.");
 
         var amount = decimal.Round(request.UnitPrice, 3, MidpointRounding.AwayFromZero);
         return repository.UpsertPrice(request.ProductId, amount, ct);
@@ -47,11 +47,11 @@ public sealed class PricingManagementService(IPricingRepository repository)
     public Task<Guid> CreatePromotion(CreatePromotionRequest request, CancellationToken ct)
     {
         if (request.ProductId == Guid.Empty)
-            throw new ArgumentException("Product ID is required.");
+            throw new DomainValidationException("Product ID is required.");
         if (request.DiscountPercent is < 0 or > 100)
-            throw new ArgumentException("Discount must be between 0 and 100 percent.");
+            throw new DomainValidationException("Discount must be between 0 and 100 percent.");
         if (request.ValidUntil <= request.ValidFrom)
-            throw new ArgumentException("Promotion end must be after its start.");
+            throw new DomainValidationException("Promotion end must be after its start.");
 
         return repository.AddPromotion(new PromotionEntity
         {

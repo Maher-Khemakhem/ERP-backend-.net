@@ -35,8 +35,8 @@ public sealed record LotReceipt(
 /// roll one back, so a sale (POS) or a receipt (Procurement) stays atomic with its stock movement. They flush
 /// their own changes (so later reads in the same transaction see them) but the caller decides whether to commit.
 ///
-/// Errors: <see cref="ArgumentException"/> for invalid input (unknown product, unit mismatch, bad quantity);
-/// <see cref="InvalidOperationException"/> for business conflicts (insufficient stock).
+/// Errors: <see cref="DomainValidationException"/> for invalid input (unknown product, unit mismatch, bad quantity);
+/// <see cref="ConflictException"/> for business conflicts (insufficient stock).
 /// </summary>
 public interface IInventoryStock
 {

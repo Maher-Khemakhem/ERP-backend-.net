@@ -99,7 +99,7 @@ public sealed class PosController(
         CancellationToken ct)
     {
         if (!await service.RemoveLine(id, lineId, ct))
-            throw new ArgumentException($"Line not found: {lineId}");
+            throw new DomainValidationException($"Line not found: {lineId}");
         return Ok();
     }
 

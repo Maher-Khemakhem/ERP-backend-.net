@@ -47,5 +47,5 @@ public sealed class StripeCheckoutController(IStripeCheckoutService service) : C
     private Guid CustomerId() =>
         Guid.TryParse(User.FindFirstValue("userId"), out var id)
             ? id
-            : throw new InvalidOperationException("The authenticated token has no user ID.");
+            : throw new ConflictException("The authenticated token has no user ID.");
 }

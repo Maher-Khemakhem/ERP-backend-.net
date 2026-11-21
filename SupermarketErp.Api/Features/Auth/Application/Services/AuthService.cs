@@ -27,7 +27,7 @@ public sealed class AuthService(
             "EXEC sp_getapplock @Resource = 'supermarket-erp-first-admin', @LockMode = 'Exclusive', @LockOwner = 'Transaction'",
             ct);
         if (await db.Users.AnyAsync(ct))
-            throw new InvalidOperationException("The initial administrator has already been created.");
+            throw new ConflictException("The initial administrator has already been created.");
 
         var user = InsertUser(request, [Roles.Admin]);
         await db.SaveChangesAsync(ct);
@@ -95,7 +95,7 @@ public sealed class AuthService(
         var roles = ValidateRoles(rolesInput);
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
         var user = await db.Users.Include(x => x.Roles).SingleOrDefaultAsync(x => x.Id == userId, ct)
-            ?? throw new ArgumentException($"User not found: {userId}");
+            ?? throw new DomainValidationException($"User not found: {userId}");
         user.Roles.Clear();
         foreach (var role in roles)
             user.Roles.Add(new AuthUserRole { UserId = user.Id, Role = role });
@@ -108,7 +108,7 @@ public sealed class AuthService(
     public async Task<UserView> UpdateEnabled(Guid userId, bool enabled, CancellationToken ct)
     {
         var user = await db.Users.Include(x => x.Roles).SingleOrDefaultAsync(x => x.Id == userId, ct)
-            ?? throw new ArgumentException($"User not found: {userId}");
+            ?? throw new DomainValidationException($"User not found: {userId}");
         user.Enabled = enabled;
         user.Version++;
         await db.SaveChangesAsync(ct);
@@ -161,20 +161,20 @@ public sealed class AuthService(
     private static void ValidateCredentials(string username, string displayName, string password)
     {
         if (string.IsNullOrWhiteSpace(username) || username.Trim().Length is < 3 or > 80)
-            throw new ArgumentException("Username must contain between 3 and 80 characters.");
+            throw new DomainValidationException("Username must contain between 3 and 80 characters.");
         if (string.IsNullOrWhiteSpace(displayName) || displayName.Trim().Length > 120)
-            throw new ArgumentException("Display name is required and cannot exceed 120 characters.");
+            throw new DomainValidationException("Display name is required and cannot exceed 120 characters.");
         if (string.IsNullOrWhiteSpace(password) || password.Length is < 8 or > 200)
-            throw new ArgumentException("Password must contain between 8 and 200 characters.");
+            throw new DomainValidationException("Password must contain between 8 and 200 characters.");
     }
 
     private static IReadOnlyCollection<string> ValidateRoles(IEnumerable<string>? input)
     {
-        if (input is null) throw new ArgumentException("At least one role is required.");
+        if (input is null) throw new DomainValidationException("At least one role is required.");
         var roles = input.Select(role => role.Trim().ToUpperInvariant()).Distinct().ToArray();
-        if (roles.Length == 0) throw new ArgumentException("At least one role is required.");
+        if (roles.Length == 0) throw new DomainValidationException("At least one role is required.");
         var unknown = roles.FirstOrDefault(role => !Roles.All.Contains(role));
-        if (unknown is not null) throw new ArgumentException($"Unknown role: {unknown}");
+        if (unknown is not null) throw new DomainValidationException($"Unknown role: {unknown}");
         return roles;
     }
 }

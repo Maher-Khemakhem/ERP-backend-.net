@@ -11,8 +11,8 @@ public sealed class ProductImageStorage(IConfiguration configuration) : IProduct
     {
         if (file is null || file.Length == 0 || string.IsNullOrWhiteSpace(file.ContentType)
             || !file.ContentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("An image file is required.");
-        if (file.Length > 5 * 1024 * 1024) throw new ArgumentException("Image cannot exceed 5 MB.");
+            throw new DomainValidationException("An image file is required.");
+        if (file.Length > 5 * 1024 * 1024) throw new DomainValidationException("Image cannot exceed 5 MB.");
         var extension = Path.GetExtension(Path.GetFileName(file.FileName));
         if (extension.Length > 12) extension = "";
         var filename = Guid.NewGuid().ToString() + (string.IsNullOrEmpty(extension) ? ".img" : extension.ToLowerInvariant());

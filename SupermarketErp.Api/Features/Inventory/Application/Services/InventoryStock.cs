@@ -29,7 +29,7 @@ public sealed class InventoryStock(BusinessDbContext db) : IInventoryStock
 
     public async Task<IReadOnlyList<ProductInfo>> SearchOnlineProducts(string? search, Guid? familyId, CancellationToken ct)
     {
-        if (search?.Length > 120) throw new ArgumentException("Search cannot exceed 120 characters.");
+        if (search?.Length > 120) throw new DomainValidationException("Search cannot exceed 120 characters.");
         var text = search?.Trim().ToLower();
         var products = await Products()
             .Where(x => x.OnlineVisible && (familyId == null || x.FamilyId == familyId)
@@ -54,21 +54,21 @@ public sealed class InventoryStock(BusinessDbContext db) : IInventoryStock
 
     public async Task ReceiveLot(LotReceipt receipt, CancellationToken ct)
     {
-        if (receipt.Quantity <= 0) throw new ArgumentException("Quantity must be positive.");
-        if (receipt.UnitCost < 0) throw new ArgumentException("Unit cost cannot be negative.");
+        if (receipt.Quantity <= 0) throw new DomainValidationException("Quantity must be positive.");
+        if (receipt.UnitCost < 0) throw new DomainValidationException("Unit cost cannot be negative.");
         var unit = NormalizeUnit(receipt.UnitType);
         if (unit == "EACH" && receipt.Quantity != decimal.Truncate(receipt.Quantity))
-            throw new ArgumentException("EACH quantities must be whole numbers.");
+            throw new DomainValidationException("EACH quantities must be whole numbers.");
         var quantity = unit == "WEIGHT" ? decimal.Round(receipt.Quantity, 3, MidpointRounding.AwayFromZero) : receipt.Quantity;
 
         var product = await db.Products.SingleOrDefaultAsync(x => x.Id == receipt.ProductId, ct)
-            ?? throw new ArgumentException($"Product not found: {receipt.ProductId}");
+            ?? throw new DomainValidationException($"Product not found: {receipt.ProductId}");
         if (!product.UnitType.Equals(unit, StringComparison.Ordinal))
-            throw new ArgumentException("Requested unit type does not match the product.");
+            throw new DomainValidationException("Requested unit type does not match the product.");
         if (product.Perishable && receipt.ExpiryDate is null)
-            throw new ArgumentException("Perishable products require an expiry date.");
+            throw new DomainValidationException("Perishable products require an expiry date.");
 
-        var stock = await db.StockLevels.SingleOrDefaultAsync(x => x.ProductId == receipt.ProductId, ct);
+        var stock = await LockStock(receipt.ProductId, ct);
         if (stock is null)
         {
             stock = new StockLevelEntity { Id = Guid.NewGuid(), ProductId = receipt.ProductId, Version = 0 };
@@ -99,13 +99,13 @@ public sealed class InventoryStock(BusinessDbContext db) : IInventoryStock
 
     public async Task<decimal> Sell(Guid productId, decimal quantity, string unitType, CancellationToken ct)
     {
-        var stock = await db.StockLevels.SingleOrDefaultAsync(x => x.ProductId == productId, ct)
-            ?? throw new InvalidOperationException($"No stock found for product: {productId}");
+        var stock = await LockStock(productId, ct)
+            ?? throw new ConflictException($"No stock found for product: {productId}");
         var lots = await FefoLots(stock.Id, UnitCode(NormalizeUnit(unitType)), ct);
 
         var available = lots.Sum(x => x.Available);
         if (available < quantity)
-            throw new InvalidOperationException(
+            throw new ConflictException(
                 $"Insufficient stock for product {productId}: requested {quantity}, available {available}.");
 
         var remaining = quantity;
@@ -131,7 +131,7 @@ public sealed class InventoryStock(BusinessDbContext db) : IInventoryStock
         var stock = await RequireStock(productId, ct);
         var lots = await FefoLots(stock.Id, UnitCode(NormalizeUnit(unitType)), ct);
         if (lots.Sum(x => x.Available) < quantity)
-            throw new InvalidOperationException($"Insufficient available stock for product {productId}.");
+            throw new ConflictException($"Insufficient available stock for product {productId}.");
 
         var remaining = quantity;
         foreach (var lot in lots)
@@ -150,7 +150,7 @@ public sealed class InventoryStock(BusinessDbContext db) : IInventoryStock
         var stock = await RequireStock(productId, ct);
         var lots = await FefoLots(stock.Id, UnitCode(NormalizeUnit(unitType)), ct);
         if (lots.Sum(x => x.Reserved) < quantity)
-            throw new InvalidOperationException("Reserved stock is insufficient to release.");
+            throw new ConflictException("Reserved stock is insufficient to release.");
 
         var remaining = quantity;
         foreach (var lot in lots.Where(x => x.Reserved > 0))
@@ -168,7 +168,7 @@ public sealed class InventoryStock(BusinessDbContext db) : IInventoryStock
         var stock = await RequireStock(productId, ct);
         var lots = await FefoLots(stock.Id, UnitCode(NormalizeUnit(unitType)), ct);
         if (lots.Sum(x => x.Reserved) < quantity)
-            throw new InvalidOperationException("Reserved stock is insufficient.");
+            throw new ConflictException("Reserved stock is insufficient.");
 
         var remaining = quantity;
         decimal cost = 0;
@@ -194,8 +194,16 @@ public sealed class InventoryStock(BusinessDbContext db) : IInventoryStock
         x.Family?.ImageUrl, x.ImageUrl, x.UnitType, x.Perishable, x.ReorderPoint ?? 0, x.VatRate ?? DefaultVatRate, x.OnlineVisible);
 
     private async Task<StockLevelEntity> RequireStock(Guid productId, CancellationToken ct) =>
-        await db.StockLevels.SingleOrDefaultAsync(x => x.ProductId == productId, ct)
-        ?? throw new InvalidOperationException($"No stock exists for product {productId}.");
+        await LockStock(productId, ct) ?? throw new ConflictException($"No stock exists for product {productId}.");
+
+    /// <summary>
+    /// Loads a product's stock level and takes an update lock on it for the rest of the transaction. Sales of the same
+    /// product then queue up one behind the other instead of all reading first and deadlocking when they write.
+    /// </summary>
+    private async Task<StockLevelEntity?> LockStock(Guid productId, CancellationToken ct) =>
+        (await db.StockLevels
+            .FromSqlInterpolated($"SELECT * FROM inventory.stock_level WITH (UPDLOCK, HOLDLOCK) WHERE product_id = {productId}")
+            .ToListAsync(ct)).SingleOrDefault();
 
     private sealed record Lot(LotEntryEntity Entry, decimal OnHand, decimal Reserved, decimal UnitCost)
     {
@@ -229,7 +237,7 @@ public sealed class InventoryStock(BusinessDbContext db) : IInventoryStock
     private static string NormalizeUnit(string unit)
     {
         var normalized = unit?.Trim().ToUpperInvariant();
-        return normalized is "EACH" or "WEIGHT" ? normalized : throw new ArgumentException("Unit type must be EACH or WEIGHT.");
+        return normalized is "EACH" or "WEIGHT" ? normalized : throw new DomainValidationException("Unit type must be EACH or WEIGHT.");
     }
 
     private static short UnitCode(string unit) => unit == "EACH" ? (short)0 : (short)1;

@@ -92,6 +92,70 @@ public sealed partial class ModuleBoundaryTests
         Assert.True(violations.Count == 0, "Forbidden module dependencies:\n  " + string.Join("\n  ", violations));
     }
 
+    // ---- layers inside a module ------------------------------------------------------------
+
+    /// <summary>
+    /// Application services that still use the database context directly. This list may only shrink: new use cases
+    /// load aggregates through a repository and save through the unit of work. Remove a name once it is migrated.
+    /// </summary>
+    private static readonly string[] ApplicationServicesStillUsingTheDbContext =
+    [
+        @"Auth\Application\Services\AuthService.cs",
+        @"Ecommerce\Application\Services\StripeCheckout.cs",
+        @"Inventory\Application\Services\InventoryStock.cs",
+        @"Pricing\Application\Services\PricingService.cs",
+    ];
+
+    [Fact]
+    public void Controllers_and_endpoints_do_not_touch_the_database_or_repositories()
+    {
+        var forbidden = new Regex(@"\b(BusinessDbContext|AuthDbContext|\w+Repository)\b");
+        var violations = Layer("Presentation").SelectMany(file => CodeLines(file)
+            .Where(line => forbidden.IsMatch(line.Text)).Select(line => $"{Relative(file)}:{line.Number} {forbidden.Match(line.Text).Value}"));
+
+        Assert.True(!violations.Any(), "Presentation must call application services only:\n  " + string.Join("\n  ", violations));
+    }
+
+    [Fact]
+    public void Domain_entities_do_not_depend_on_infrastructure_frameworks_or_other_modules()
+    {
+        var forbidden = new Regex(@"Microsoft\.EntityFrameworkCore|Microsoft\.AspNetCore|Microsoft\.Data|SupermarketErp\.Api\.Infrastructure|\b(BusinessDbContext|AuthDbContext)\b");
+        var violations = new List<string>();
+        foreach (var (module, files) in Modules().Select(m => (m.Name, m.Files)))
+            foreach (var file in files.Where(f => IsInLayer(f, "Domain")))
+                foreach (var (number, line) in CodeLines(file))
+                {
+                    if (forbidden.IsMatch(line)) violations.Add($"{Relative(file)}:{number} {forbidden.Match(line).Value}");
+                    foreach (Match reference in FeatureReference().Matches(line))
+                        if (reference.Groups[1].Value != module) violations.Add($"{Relative(file)}:{number} uses module {reference.Groups[1].Value}");
+                }
+
+        Assert.True(violations.Count == 0, "Domain code must be plain C#:\n  " + string.Join("\n  ", violations));
+    }
+
+    [Fact]
+    public void Business_failures_use_domain_exceptions_so_programming_errors_stay_server_errors()
+    {
+        // The API turns DomainException into 400/409. If features threw ArgumentException or InvalidOperationException
+        // for business rules, a genuine bug raising the same type would be shown to callers as a "bad request".
+        var generic = new Regex(@"new\s+(ArgumentException|InvalidOperationException)\b|catch\s*\(\s*(ArgumentException|InvalidOperationException)\b");
+        var violations = Modules().SelectMany(m => m.Files).SelectMany(file => CodeLines(file)
+            .Where(line => generic.IsMatch(line.Text)).Select(line => $"{Relative(file)}:{line.Number} {generic.Match(line.Text).Value}"));
+
+        Assert.True(!violations.Any(), "Throw DomainValidationException (400) or ConflictException (409) instead:\n  " + string.Join("\n  ", violations));
+    }
+
+    [Fact]
+    public void Application_services_do_not_grow_new_dependencies_on_the_database_context()
+    {
+        var dbContext = new Regex(@"\b(BusinessDbContext|AuthDbContext)\b");
+        var using_ = Layer("Application")
+            .Where(file => CodeLines(file).Any(line => dbContext.IsMatch(line.Text)))
+            .Select(Relative).Order().ToArray();
+
+        Assert.Equal(ApplicationServicesStillUsingTheDbContext.Order().ToArray(), using_);
+    }
+
     [Fact]
     public void The_dependency_rules_have_no_cycles()
     {
@@ -119,6 +183,12 @@ public sealed partial class ModuleBoundaryTests
         return Directory.GetDirectories(root).Select(directory =>
             (Path.GetFileName(directory), Directory.GetFiles(directory, "*.cs", SearchOption.AllDirectories)));
     }
+
+    private static bool IsInLayer(string file, string layer) =>
+        Relative(file).Split(Path.DirectorySeparatorChar).Contains(layer);
+
+    private static IEnumerable<string> Layer(string layer) =>
+        Modules().SelectMany(m => m.Files).Where(file => IsInLayer(file, layer));
 
     /// <summary>Code lines with line numbers, comments removed so prose mentioning a table does not count.</summary>
     private static IEnumerable<(int Number, string Text)> CodeLines(string file)

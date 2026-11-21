@@ -32,7 +32,7 @@ public sealed class StripeCheckoutService(
         RequireConfigured();
         var order = await ReadOwnedOrder(customerId, orderId, ct);
         if (order.Status != "PENDING_PAYMENT" || order.ExpiresAt <= DateTimeOffset.UtcNow)
-            throw new InvalidOperationException("Only an unexpired pending order can start Stripe Checkout.");
+            throw new ConflictException("Only an unexpired pending order can start Stripe Checkout.");
         var existing = await GetCheckoutByOrder(orderId, ct);
         if (existing is not null) return ToQuote(existing);
         return ConvertAmount(order.Total);
@@ -43,7 +43,7 @@ public sealed class StripeCheckoutService(
         var quote = await Quote(customerId, orderId, ct);
         var order = await ReadOwnedOrder(customerId, orderId, ct);
         var checkout = await PrepareCheckout(order, quote, ct);
-        if (checkout.Status == "EXPIRED") throw new InvalidOperationException("Stripe Checkout expired; cancel this order and place a new one.");
+        if (checkout.Status == "EXPIRED") throw new ConflictException("Stripe Checkout expired; cancel this order and place a new one.");
         if (!string.IsNullOrWhiteSpace(checkout.Url)) return new StripeCheckoutResult(checkout.Url, ToQuote(checkout));
 
         var baseUrl = _returnBaseUrl.EndsWith('/') ? _returnBaseUrl : _returnBaseUrl + "/";
@@ -70,13 +70,13 @@ public sealed class StripeCheckoutService(
         request.Headers.Add("Idempotency-Key", checkout.Id.ToString());
         using var response = await clients.CreateClient("stripe").SendAsync(request, ct);
         var json = await response.Content.ReadAsStringAsync(ct);
-        if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"Stripe Checkout request failed (HTTP {(int)response.StatusCode}).");
+        if (!response.IsSuccessStatusCode) throw new ConflictException($"Stripe Checkout request failed (HTTP {(int)response.StatusCode}).");
         using var document = JsonDocument.Parse(json);
         var session = ReadSession(document.RootElement);
         if (!session.Id.StartsWith("cs_test_", StringComparison.Ordinal)
             || string.IsNullOrWhiteSpace(session.Url)
             || !session.Url.StartsWith("https://checkout.stripe.com/", StringComparison.Ordinal))
-            throw new InvalidOperationException("Stripe returned an invalid test Checkout session.");
+            throw new ConflictException("Stripe returned an invalid test Checkout session.");
 
         var saved = await db.StripeCheckouts.FirstOrDefaultAsync(x => x.Id == checkout.Id && x.Status == "CREATING", ct);
         if (saved is not null)
@@ -93,7 +93,7 @@ public sealed class StripeCheckoutService(
     public async Task<string> Reconcile(Guid customerId, Guid orderId, CancellationToken ct)
     {
         _ = await ReadOwnedOrder(customerId, orderId, ct);
-        var checkout = await GetCheckoutByOrder(orderId, ct) ?? throw new ArgumentException("Stripe Checkout not found.");
+        var checkout = await GetCheckoutByOrder(orderId, ct) ?? throw new DomainValidationException("Stripe Checkout not found.");
         if (checkout.Status == "PAID" || checkout.SessionId is null) return checkout.Status;
         var session = await Retrieve(checkout.SessionId, ct);
         if (session.Status == "expired")
@@ -129,10 +129,10 @@ public sealed class StripeCheckoutService(
         if (checkout.Status == "PAID" || session.PaymentStatus != "paid") return;
         if (checkout.SessionId != session.Id || checkout.Id.ToString() != session.ClientReferenceId
             || session.Currency != "eur" || session.AmountTotal != checkout.AmountCents || session.LiveMode)
-            throw new InvalidOperationException("Stripe Checkout does not match the saved test-mode order quote.");
+            throw new ConflictException("Stripe Checkout does not match the saved test-mode order quote.");
         var order = await ReadOrderById(checkout.OrderId, ct);
         if (order.Total != checkout.TndAmount)
-            throw new InvalidOperationException("Online order total changed after payment; manual refund required.");
+            throw new ConflictException("Online order total changed after payment; manual refund required.");
         await orders.ConfirmStripePayment(checkout.OrderId, "STRIPE-" + checkout.SessionId, ct);
         await UpdateCheckoutStatus(checkout.Id, "PAID", ct);
     }
@@ -147,10 +147,9 @@ public sealed class StripeCheckoutService(
         var row = new CheckoutRow(Guid.NewGuid(), order.Id, null, null, order.Total, quote.AmountCents, quote.Rate, "CREATING");
         db.StripeCheckouts.Add(new StripeCheckoutEntity { Id = row.Id, OrderId = row.OrderId, TndAmount = row.TndAmount, AmountCents = row.AmountCents, Rate = row.Rate, Status = row.Status, CreatedAt = DateTimeOffset.UtcNow });
         var orderEntity = await db.OnlineOrders.FirstOrDefaultAsync(x => x.Id == order.Id && x.Status == "PENDING_PAYMENT", ct)
-            ?? throw new InvalidOperationException("Order is no longer pending payment.");
+            ?? throw new ConflictException("Order is no longer pending payment.");
         var deadline = DateTimeOffset.UtcNow.AddMinutes(35);
-        if (orderEntity.ExpiresAt < deadline) orderEntity.ExpiresAt = deadline;
-        orderEntity.Version++;
+        orderEntity.ExtendPaymentWindow(deadline);
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
         return row;
@@ -176,14 +175,14 @@ public sealed class StripeCheckoutService(
     private async Task<OwnedOrder> ReadOwnedOrder(Guid customerId, Guid id, CancellationToken ct)
     {
         var row = await db.OnlineOrders.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id && x.CustomerId == customerId, ct)
-            ?? throw new ArgumentException("Order not found.");
+            ?? throw new DomainValidationException("Order not found.");
         return new OwnedOrder(row.Id, row.CustomerId, row.Status, row.TotalAmount, row.ExpiresAt);
     }
 
     private async Task<OwnedOrder> ReadOrderById(Guid id, CancellationToken ct)
     {
         var row = await db.OnlineOrders.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id, ct)
-            ?? throw new ArgumentException("Order not found.");
+            ?? throw new DomainValidationException("Order not found.");
         return new OwnedOrder(row.Id, row.CustomerId, row.Status, row.TotalAmount, row.ExpiresAt);
     }
 
@@ -193,7 +192,7 @@ public sealed class StripeCheckoutService(
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _secretKey);
         using var response = await clients.CreateClient("stripe").SendAsync(request, ct);
         var body = await response.Content.ReadAsStringAsync(ct);
-        if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"Stripe status request failed (HTTP {(int)response.StatusCode}).");
+        if (!response.IsSuccessStatusCode) throw new ConflictException($"Stripe status request failed (HTTP {(int)response.StatusCode}).");
         using var document = JsonDocument.Parse(body);
         return ReadSession(document.RootElement);
     }
@@ -206,8 +205,8 @@ public sealed class StripeCheckoutService(
 
     private void VerifyWebhook(string payload, string? signature)
     {
-        if (!_webhookSecret.StartsWith("whsec_", StringComparison.Ordinal)) throw new InvalidOperationException("Storefront Stripe test mode is not configured.");
-        if (string.IsNullOrWhiteSpace(signature)) throw new ArgumentException("Missing Stripe signature.");
+        if (!_webhookSecret.StartsWith("whsec_", StringComparison.Ordinal)) throw new ConflictException("Storefront Stripe test mode is not configured.");
+        if (string.IsNullOrWhiteSpace(signature)) throw new DomainValidationException("Missing Stripe signature.");
         string? timestamp = null;
         var signatures = new List<string>();
         foreach (var part in signature.Split(','))
@@ -216,7 +215,7 @@ public sealed class StripeCheckoutService(
             if (part.StartsWith("v1=", StringComparison.Ordinal)) signatures.Add(part[3..]);
         }
         if (!long.TryParse(timestamp, out var seconds) || Math.Abs(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - seconds) > 300)
-            throw new ArgumentException("Invalid Stripe signature timestamp.");
+            throw new DomainValidationException("Invalid Stripe signature timestamp.");
         using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_webhookSecret));
         var expected = hmac.ComputeHash(Encoding.UTF8.GetBytes($"{timestamp}.{payload}"));
         foreach (var value in signatures)
@@ -227,14 +226,14 @@ public sealed class StripeCheckoutService(
             }
             catch (FormatException) { }
         }
-        throw new ArgumentException("Invalid Stripe signature.");
+        throw new DomainValidationException("Invalid Stripe signature.");
     }
 
     private StripeQuote ConvertAmount(decimal amount)
     {
-        if (_rate <= 0) throw new InvalidOperationException("Storefront Stripe test mode is not configured.");
+        if (_rate <= 0) throw new ConflictException("Storefront Stripe test mode is not configured.");
         var cents = decimal.ToInt64(decimal.Round(amount * _rate * 100m, 0, MidpointRounding.AwayFromZero));
-        if (cents < MinimumCents || cents > MaximumCents) throw new ArgumentException("Converted EUR charge must be between 0.50 and 999,999.99.");
+        if (cents < MinimumCents || cents > MaximumCents) throw new DomainValidationException("Converted EUR charge must be between 0.50 and 999,999.99.");
         return new StripeQuote("EUR", amount, cents, _rate);
     }
 
@@ -249,7 +248,7 @@ public sealed class StripeCheckoutService(
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
     private void RequireConfigured()
     {
-        if (!IsConfigured) throw new InvalidOperationException("Storefront Stripe test mode is not configured.");
+        if (!IsConfigured) throw new ConflictException("Storefront Stripe test mode is not configured.");
     }
     private bool IsConfigured => _secretKey.StartsWith("sk_test_", StringComparison.Ordinal)
         && _webhookSecret.StartsWith("whsec_", StringComparison.Ordinal)

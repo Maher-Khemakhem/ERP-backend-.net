@@ -18,14 +18,14 @@ public sealed class PricingService(
         CancellationToken ct)
     {
         var product = await inventory.FindProduct(productId, ct)
-            ?? throw new ArgumentException($"Product not found: {productId}");
+            ?? throw new DomainValidationException($"Product not found: {productId}");
 
         if (!product.UnitType.Equals(unitType, StringComparison.Ordinal))
-            throw new ArgumentException("Requested unit type does not match the product.");
+            throw new DomainValidationException("Requested unit type does not match the product.");
 
         var price = await repository.GetPrice(productId, ct);
         if (price?.UnitPrice is not decimal unitPrice)
-            throw new ArgumentException($"No price defined for product: {productId}");
+            throw new DomainValidationException($"No price defined for product: {productId}");
 
         var now = DateTimeOffset.UtcNow;
         var discount = await repository.GetActiveDiscount(productId, now, ct);

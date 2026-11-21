@@ -1,30 +1,21 @@
-using SupermarketErp.Api.Features.Auth;
 using Microsoft.EntityFrameworkCore;
 using SupermarketErp.Api.Infrastructure;
 
 namespace SupermarketErp.Api.Features.Inventory;
 
-public sealed class InventoryRepository(BusinessDbContext db, IInventoryStock inventoryStock) : IInventoryRepository
+/// <summary>
+/// Persistence and read models for the catalog families and the stock overview. The stock views are queries that
+/// join products, stock levels and lots; stock movements themselves go through <see cref="IInventoryStock"/>.
+/// </summary>
+public sealed class InventoryRepository(BusinessDbContext db) : IInventoryRepository
 {
-    public async Task<IReadOnlyList<FamilyView>> ListFamilies(CancellationToken ct)
-    {
-        return await db.ProductFamilies.AsNoTracking().OrderBy(x => x.Name)
-            .Select(x => new FamilyView(x.Id, x.Name, x.ImageUrl)).ToListAsync(ct);
-    }
+    public async Task<IReadOnlyList<ProductFamilyEntity>> ListFamilies(CancellationToken ct) =>
+        await db.ProductFamilies.AsNoTracking().OrderBy(x => x.Name).ToListAsync(ct);
 
-    public async Task<Guid> CreateFamily(CreateFamilyRequest request, CancellationToken ct)
-    {
-        if (string.IsNullOrWhiteSpace(request.Name)) throw new ArgumentException("Family name is required.");
-        if (request.Name.Trim().Length > 160) throw new ArgumentException("Family name cannot exceed 160 characters.");
-        if (request.ImageUrl?.Length > 500) throw new ArgumentException("Image URL cannot exceed 500 characters.");
-        var name = request.Name.Trim();
-        if (await db.ProductFamilies.AnyAsync(x => x.Name.ToLower() == name.ToLower(), ct))
-            throw new InvalidOperationException("A product family with this name already exists.");
-        var id = Guid.NewGuid();
-        db.ProductFamilies.Add(new ProductFamilyEntity { Id = id, Name = name, ImageUrl = Normalize(request.ImageUrl) });
-        await db.SaveChangesAsync(ct);
-        return id;
-    }
+    public Task<bool> FamilyNameTaken(string name, CancellationToken ct) =>
+        db.ProductFamilies.AnyAsync(x => x.Name.ToLower() == name.ToLower(), ct);
+
+    public void Add(ProductFamilyEntity family) => db.ProductFamilies.Add(family);
 
     public async Task<IReadOnlyList<StockSummaryView>> ListStock(CancellationToken ct)
     {
@@ -62,15 +53,6 @@ public sealed class InventoryRepository(BusinessDbContext db, IInventoryStock in
         return new StockLevelView(productId, product.Name, total, reserved, total - reserved, lots);
     }
 
-    public async Task ReceiveStock(ReceiveStockRequest request, CancellationToken ct)
-    {
-        await using var transaction = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
-        await inventoryStock.ReceiveLot(new LotReceipt(request.ProductId, request.LotNumber, request.QuantityValue,
-            request.UnitType ?? "", request.ExpiryDate, request.ReceivedDate, request.SupplierReference,
-            request.UnitCost ?? 0m), ct);
-        await transaction.CommitAsync(ct);
-    }
-
     private sealed record StockRow(Guid ProductId, Guid LotId, string LotNumber, decimal OnHand, decimal Reserved,
         DateOnly? ExpiryDate, DateOnly ReceivedDate, decimal UnitCost, string? SupplierReference);
 
@@ -83,7 +65,4 @@ public sealed class InventoryRepository(BusinessDbContext db, IInventoryStock in
                           entry.ReservedValue ?? 0, lot.ExpiryDate, lot.ReceivedDate, lot.UnitCost, lot.SupplierReference))
             .ToListAsync(ct);
     }
-
-    private static string? Normalize(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }
-

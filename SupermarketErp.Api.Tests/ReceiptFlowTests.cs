@@ -44,7 +44,7 @@ public sealed class ReceiptFlowTests(ApiFixture fixture) : IClassFixture<ApiFixt
         var order = await Api.CreateOrder(await Api.CreateSupplier(), (product, 5m, 2m), (product, 3m, 2.5m));
         await Api.PlaceOrder(order);
         var lines = (await Api.Order(order)).GetProperty("lines").EnumerateArray()
-            .Select(l => (Id: l.GetProperty("id").GetGuid(), Quantity: decimal.Parse(l.GetProperty("quantity").GetString()!)))
+            .Select(l => (Id: l.GetProperty("id").GetGuid(), Quantity: decimal.Parse(l.GetProperty("quantity").GetString()!, System.Globalization.CultureInfo.InvariantCulture)))
             .ToArray();
 
         var (status, body) = await Api.Receive(order, lines.Select(l => ErpApi.ReceiptLine(l.Id, l.Quantity)).ToArray());

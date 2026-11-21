@@ -14,9 +14,9 @@ public sealed class ScannerPairingService(
     public async Task<ScannerPairingView> Create(Guid transactionId, CancellationToken ct)
     {
         var transaction = await pos.GetTransaction(transactionId, ct)
-            ?? throw new ArgumentException($"Ticket not found: {transactionId}");
+            ?? throw new DomainValidationException($"Ticket not found: {transactionId}");
         if (transaction.Status != "IN_PROGRESS")
-            throw new InvalidOperationException("Only an in-progress ticket can use the phone scanner.");
+            throw new ConflictException("Only an in-progress ticket can use the phone scanner.");
 
         var now = DateTimeOffset.UtcNow;
         store.RemoveExpiredOrForTransaction(now, transactionId);
@@ -36,13 +36,13 @@ public sealed class ScannerPairingService(
     {
         var pairing = Require(sessionId, token);
         var transaction = await pos.GetTransaction(pairing.TransactionId, ct)
-            ?? throw new ArgumentException("Scanner ticket no longer exists.");
+            ?? throw new DomainValidationException("Scanner ticket no longer exists.");
         if (transaction.Status != "IN_PROGRESS")
-            throw new InvalidOperationException("Only an in-progress ticket can use the phone scanner.");
+            throw new ConflictException("Only an in-progress ticket can use the phone scanner.");
 
         var barcode = rawBarcode?.Trim() ?? "";
         var product = await inventory.FindProductBySku(barcode, ct)
-            ?? throw new ArgumentException($"No product found for barcode: {barcode}");
+            ?? throw new DomainValidationException($"No product found for barcode: {barcode}");
 
         var quantity = product.UnitType == "WEIGHT" ? 0.1m : 1m;
         var line = await pos.AddLine(
@@ -74,13 +74,13 @@ public sealed class ScannerPairingService(
             pairing.ExpiresAt < DateTimeOffset.UtcNow)
         {
             store.Remove(sessionId);
-            throw new ArgumentException("Scanner pairing has expired or does not exist.");
+            throw new DomainValidationException("Scanner pairing has expired or does not exist.");
         }
 
         if (token is null || !CryptographicOperations.FixedTimeEquals(
                 System.Text.Encoding.UTF8.GetBytes(token),
                 System.Text.Encoding.UTF8.GetBytes(pairing.Token)))
-            throw new ArgumentException("Invalid scanner pairing token.");
+            throw new DomainValidationException("Invalid scanner pairing token.");
 
         return pairing;
     }

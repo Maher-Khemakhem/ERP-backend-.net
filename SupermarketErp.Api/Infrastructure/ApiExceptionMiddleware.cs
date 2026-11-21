@@ -1,4 +1,5 @@
 using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Mvc;
 using SupermarketErp.Api.Features.Auth;
 using SupermarketErp.Api.Features.Ecommerce;
@@ -29,17 +30,17 @@ public sealed class ApiExceptionMiddleware(
         {
             await WriteError(context, StatusCodes.Status503ServiceUnavailable, ex.Message);
         }
-        catch (ArgumentException ex)
+        catch (DomainValidationException ex)
         {
             await WriteError(context, StatusCodes.Status400BadRequest, ex.Message);
         }
-        catch (InvalidOperationException ex)
+        catch (ConflictException ex)
         {
             await WriteError(context, StatusCodes.Status409Conflict, ex.Message);
         }
-        catch (SqlException ex) when (ex.Number is 2601 or 2627 or 547)
+        catch (Exception ex) when (IsConstraintViolation(ex))
         {
-            await WriteError(context, StatusCodes.Status409Conflict, "The requested change conflicts with existing data.");
+            await WriteError(context, StatusCodes.Status409Conflict, "The requested change conflicts with data that is already stored.");
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
@@ -47,10 +48,18 @@ public sealed class ApiExceptionMiddleware(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Unhandled API exception for {Method} {Path}", context.Request.Method, context.Request.Path);
+            logger.LogError(ex, "Unhandled exception while serving {Method} {Path}", context.Request.Method, context.Request.Path);
             await WriteError(context, StatusCodes.Status500InternalServerError, "Une erreur inattendue est survenue");
         }
     }
+
+    /// <summary>
+    /// A unique-key (2601, 2627) or foreign-key (547) violation. EF Core reports it wrapped in a
+    /// <see cref="DbUpdateException"/>, so the SQL error is looked for in the exception and its inner exception.
+    /// </summary>
+    private static bool IsConstraintViolation(Exception exception) =>
+        (exception as SqlException ?? (exception as DbUpdateException)?.InnerException as SqlException)
+            is { Number: 2601 or 2627 or 547 };
 
     private async Task WriteError(HttpContext context, int status, string message)
     {

@@ -39,7 +39,7 @@ public sealed class AuthController(
         if (username is null) return Unauthorized();
 
         var user = await service.FindByUsername(username, ct);
-        return Ok(user ?? throw new ArgumentException("User not found"));
+        return Ok(user ?? throw new DomainValidationException("User not found"));
     }
 
     [HttpGet("api/auth/users")]

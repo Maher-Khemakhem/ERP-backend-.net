@@ -27,7 +27,7 @@ public sealed class StorefrontOrderController(IStorefrontOrderService service) :
         CancellationToken ct)
     {
         if (productId != request.ProductId)
-            throw new ArgumentException("Product ID in path and body must match.");
+            throw new DomainValidationException("Product ID in path and body must match.");
         return Ok(await service.ChangeCartItem(CustomerId(), request, ct));
     }
 
@@ -66,5 +66,5 @@ public sealed class StorefrontOrderController(IStorefrontOrderService service) :
     private Guid CustomerId() =>
         Guid.TryParse(User.FindFirstValue("userId"), out var id)
             ? id
-            : throw new InvalidOperationException("The authenticated token has no user ID.");
+            : throw new ConflictException("The authenticated token has no user ID.");
 }
