@@ -142,7 +142,32 @@ public sealed partial class ModuleBoundaryTests
         var violations = Modules().SelectMany(m => m.Files).SelectMany(file => CodeLines(file)
             .Where(line => generic.IsMatch(line.Text)).Select(line => $"{Relative(file)}:{line.Number} {generic.Match(line.Text).Value}"));
 
-        Assert.True(!violations.Any(), "Throw DomainValidationException (400) or ConflictException (409) instead:\n  " + string.Join("\n  ", violations));
+        Assert.True(!violations.Any(), "Throw a DomainValidationException (400) or a ConflictException (409) instead:\n  " + string.Join("\n  ", violations));
+    }
+
+    [Fact]
+    public void The_outbox_processor_knows_no_module_tables()
+    {
+        // Reacting to an event is the owning module's business (an IOutboxHandler). The platform only moves events along.
+        var processor = Path.Combine(FeaturesDirectory(), "..", "Infrastructure", "OutboxProcessor.cs");
+        var module = new Regex(@"\b(finance|procurement|inventory|pricing|pos|ecommerce|auth)\.\w+|SqlCommand|SqlConnection", RegexOptions.IgnoreCase);
+        var violations = CodeLines(processor).Where(line => module.IsMatch(line.Text))
+            .Select(line => $"OutboxProcessor.cs:{line.Number} {module.Match(line.Text).Value}");
+
+        Assert.True(!violations.Any(), "Move this into an IOutboxHandler of the module that owns it:\n  " + string.Join("\n  ", violations));
+    }
+
+    [Fact]
+    public void Every_published_event_has_exactly_one_handler_and_every_handler_has_a_publisher()
+    {
+        var sources = Modules().SelectMany(m => m.Files).SelectMany(file => CodeLines(file).Select(line => (File: file, line.Text))).ToArray();
+        var published = sources.SelectMany(x => Regex.Matches(x.Text, @"(?:Publish|OutboxWriter\.Write)(?:<[^>]*>)?\(\s*(?:db,\s*)?""(\w+)""").Select(m => m.Groups[1].Value))
+            .Distinct().Order().ToArray();
+        var handled = sources.SelectMany(x => Regex.Matches(x.Text, @"OutboxHandler<[^>]+>\(""(\w+)""\)").Select(m => m.Groups[1].Value))
+            .Order().ToArray();
+
+        Assert.NotEmpty(published);
+        Assert.Equal(published, handled);
     }
 
     [Fact]

@@ -1,21 +1,25 @@
-﻿using System.Text.Json;
-using Microsoft.Data.SqlClient;
+﻿using System.Data;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 
 namespace SupermarketErp.Api.Infrastructure;
 
 /// <summary>
-/// Delivers outbox events at least once, in order. A failing event is retried with exponential backoff
-/// (2s, 4s, 8s, ...) without holding up the events behind it, and is dead-lettered (<c>failed_at</c> set)
-/// after <see cref="MaxAttempts"/> failures, or at once when it can never succeed (unknown type, bad payload).
-/// Handlers must therefore be idempotent.
+/// Delivers outbox events at least once, in order, to the module handlers registered for their type
+/// (<see cref="IOutboxHandler"/>). A failing event is retried with exponential backoff (2s, 4s, 8s, ...) without
+/// holding up the events behind it, and is dead-lettered (<c>failed_at</c> set) after <see cref="MaxAttempts"/>
+/// failures, or at once when it can never succeed (unknown type, bad payload). Handlers must be idempotent.
+/// This class only moves events along: what an event means lives in the modules.
 /// </summary>
-public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<OutboxProcessor> logger) : BackgroundService
+public sealed class OutboxProcessor(IServiceScopeFactory scopes, ILogger<OutboxProcessor> logger) : BackgroundService
 {
     public const int MaxAttempts = 5;
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(1);
 
     /// <summary>An event that can never be handled, so retrying it is pointless.</summary>
     private sealed class PermanentOutboxException(string message) : Exception(message);
+
+    private sealed record Claimed(Guid Id, string Type, int Attempts);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -38,66 +42,43 @@ public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<Outb
         }
     }
 
+    /// <summary>Handles the oldest due event. Returns false when there is nothing to do.</summary>
     private async Task<bool> ProcessNext(CancellationToken ct)
     {
-        Guid id;
-        string type;
-        string payload;
-        int attempts;
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(ct);
-        await using (var select = new SqlCommand("""
-            SELECT TOP (1) id,event_type,payload,attempts FROM platform.dotnet_outbox WITH (UPDLOCK, READPAST, ROWLOCK)
-            WHERE processed_at IS NULL AND failed_at IS NULL
-              AND (next_attempt_at IS NULL OR next_attempt_at <= @now)
-            ORDER BY occurred_at,id
-            """, connection, transaction))
-        {
-            select.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-            await using var reader = await select.ExecuteReaderAsync(ct);
-            if (!await reader.ReadAsync(ct)) return false;
-            id = reader.GetGuid(0);
-            type = reader.GetString(1);
-            payload = reader.GetString(2);
-            attempts = reader.GetInt32(3);
-        }
-
+        Claimed? claimed = null;
         try
         {
-            switch (type)
-            {
-                case "SaleCompleted":
-                    await PostSale(connection, transaction, JsonSerializer.Deserialize<SaleCompletedEvent>(payload)!, ct);
-                    break;
-                case "OnlineSaleConfirmed":
-                    await PostOnlineSale(connection, transaction, JsonSerializer.Deserialize<SaleCompletedEvent>(payload)!, ct);
-                    break;
-                case "CashSessionClosed":
-                    await PostCashClose(connection, transaction, JsonSerializer.Deserialize<CashSessionClosedEvent>(payload)!, ct);
-                    break;
-                case "GoodsReceived":
-                    await PostGoodsReceived(connection, transaction, JsonSerializer.Deserialize<GoodsReceivedEvent>(payload)!, ct);
-                    break;
-                case "LowStockThresholdReached":
-                    await CreateLowStockAlert(connection, transaction, JsonSerializer.Deserialize<Guid>(payload), ct);
-                    break;
-                default:
-                    throw new PermanentOutboxException($"Unknown outbox event type '{type}'.");
-            }
+            using var scope = scopes.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<BusinessDbContext>();
+            var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+            var handlers = scope.ServiceProvider.GetServices<IOutboxHandler>().ToDictionary(x => x.EventType);
 
-            await using var mark = new SqlCommand(
-                "UPDATE platform.dotnet_outbox SET processed_at=@now,last_error=NULL WHERE id=@id", connection, transaction);
-            mark.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-            mark.Parameters.AddWithValue("id", id);
-            await mark.ExecuteNonQueryAsync(ct);
-            await transaction.CommitAsync(ct);
-            return true;
+            // READPAST needs read committed; the lock keeps a second processor from taking the same event.
+            return await unitOfWork.InTransaction(async () =>
+            {
+                var now = DateTimeOffset.UtcNow;
+                var row = (await db.DotnetOutbox.FromSqlInterpolated($"""
+                    SELECT TOP (1) * FROM platform.dotnet_outbox WITH (UPDLOCK, READPAST, ROWLOCK)
+                    WHERE processed_at IS NULL AND failed_at IS NULL
+                      AND (next_attempt_at IS NULL OR next_attempt_at <= {now})
+                    ORDER BY occurred_at, id
+                    """).ToListAsync(ct)).SingleOrDefault();
+                if (row is null) return false;
+
+                claimed = new Claimed(row.Id, row.EventType, row.Attempts);
+                if (!handlers.TryGetValue(row.EventType, out var handler))
+                    throw new PermanentOutboxException($"Unknown outbox event type '{row.EventType}'.");
+                await handler.Handle(row.Payload, ct);
+
+                row.ProcessedAt = DateTimeOffset.UtcNow;
+                row.LastError = null;
+                return true;
+            }, ct, IsolationLevel.ReadCommitted);
         }
-        catch (Exception exception) when (!ct.IsCancellationRequested)
+        catch (Exception exception) when (claimed is not null && !ct.IsCancellationRequested)
         {
-            await transaction.RollbackAsync(ct);
-            var permanent = exception is PermanentOutboxException or JsonException;
-            await RecordFailure(id, type, attempts, permanent, exception, ct);
+            // The transaction was rolled back; the failure is recorded separately so it survives.
+            await RecordFailure(claimed, exception, ct);
             return true;
         }
     }
@@ -106,141 +87,31 @@ public sealed class OutboxProcessor(SqlServerDataSource dataSource, ILogger<Outb
     /// Records the failure and schedules the retry. The row is deferred (or dead-lettered), so the next poll
     /// moves on to the events behind it instead of hammering the failing one.
     /// </summary>
-    private async Task RecordFailure(Guid id, string type, int attempts, bool permanent, Exception exception, CancellationToken ct)
+    private async Task RecordFailure(Claimed claimed, Exception exception, CancellationToken ct)
     {
-        var failedAttempts = attempts + 1;
+        var permanent = exception is PermanentOutboxException or JsonException;
+        var failedAttempts = claimed.Attempts + 1;
         var deadLetter = permanent || failedAttempts >= MaxAttempts;
         var now = DateTimeOffset.UtcNow;
         var backoff = TimeSpan.FromSeconds(Math.Min(Math.Pow(2, failedAttempts), MaxBackoff.TotalSeconds));
 
         if (deadLetter)
             logger.LogCritical(exception, "Outbox event {OutboxId} ({EventType}) dead-lettered after {Attempts} attempt(s); " +
-                "it will not be retried until failed_at is cleared", id, type, failedAttempts);
+                "it will not be retried until its failed_at is cleared", claimed.Id, claimed.Type, failedAttempts);
         else
             logger.LogError(exception, "Outbox event {OutboxId} ({EventType}) failed (attempt {Attempts}/{Max}); retrying in {Backoff}s",
-                id, type, failedAttempts, MaxAttempts, backoff.TotalSeconds);
+                claimed.Id, claimed.Type, failedAttempts, MaxAttempts, backoff.TotalSeconds);
 
-        await using var connection = await dataSource.OpenConnectionAsync(ct);
-        await using var command = new SqlCommand("""
-            UPDATE platform.dotnet_outbox
-            SET attempts=@attempts, last_error=@error,
-                failed_at=CASE WHEN @dead=1 THEN @now ELSE NULL END,
-                next_attempt_at=CASE WHEN @dead=1 THEN NULL ELSE @next END
-            WHERE id=@id
-            """, connection);
-        command.Parameters.AddWithValue("attempts", failedAttempts);
-        command.Parameters.AddWithValue("error", exception.Message.Length > 4000 ? exception.Message[..4000] : exception.Message);
-        command.Parameters.AddWithValue("dead", deadLetter);
-        command.Parameters.AddWithValue("now", now);
-        command.Parameters.AddWithValue("next", now + backoff);
-        command.Parameters.AddWithValue("id", id);
-        await command.ExecuteNonQueryAsync(ct);
+        var error = exception.Message.Length > 4000 ? exception.Message[..4000] : exception.Message;
+        DateTimeOffset? failedAt = deadLetter ? now : null;
+        DateTimeOffset? nextAttempt = deadLetter ? null : now + backoff;
+
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<BusinessDbContext>();
+        await db.DotnetOutbox.Where(x => x.Id == claimed.Id).ExecuteUpdateAsync(set => set
+            .SetProperty(x => x.Attempts, failedAttempts)
+            .SetProperty(x => x.LastError, error)
+            .SetProperty(x => x.FailedAt, failedAt)
+            .SetProperty(x => x.NextAttemptAt, nextAttempt), ct);
     }
-
-    private static Task PostSale(SqlConnection c, SqlTransaction tx, SaleCompletedEvent e, CancellationToken ct) =>
-        PostSaleCore(c, tx, $"sale:{e.TransactionId}", $"POS sale {e.TransactionId}", e.TransactionId,
-            e.PaymentMethod, e.NetAmount, e.VatAmount, e.GrossAmount, e.CostOfGoodsSold, ct);
-
-    private static Task PostOnlineSale(SqlConnection c, SqlTransaction tx, SaleCompletedEvent e, CancellationToken ct) =>
-        PostSaleCore(c, tx, $"online-sale:{e.TransactionId}", $"Online sale {e.TransactionId}", e.TransactionId,
-            e.PaymentMethod, e.NetAmount, e.VatAmount, e.GrossAmount, e.CostOfGoodsSold, ct);
-
-    private static async Task PostSaleCore(SqlConnection c, SqlTransaction tx, string key, string description,
-        Guid reference, string method, decimal net, decimal vat, decimal gross, decimal cogs, CancellationToken ct)
-    {
-        var lines = new List<JournalLineInput>
-        {
-            new(method == "CASH" ? "CASH_ON_HAND" : "CARD_CLEARING", gross, 0, "Customer payment"),
-            new("SALES_REVENUE", 0, net, "Retail sale")
-        };
-        if (vat != 0) lines.Add(new("OUTPUT_VAT", 0, vat, "Output VAT"));
-        if (cogs != 0)
-        {
-            lines.Add(new("COST_OF_GOODS_SOLD", cogs, 0, "Cost of goods sold"));
-            lines.Add(new("INVENTORY", 0, cogs, "Inventory consumed"));
-        }
-        await PostJournal(c, tx, key, description, reference, lines, ct);
-    }
-
-    private static async Task PostCashClose(SqlConnection c, SqlTransaction tx, CashSessionClosedEvent e, CancellationToken ct)
-    {
-        if (e.ExpectedCash == 0 && e.CountedCash == 0) return;
-        var variance = e.CountedCash - e.ExpectedCash;
-        var lines = new List<JournalLineInput>();
-        if (e.CountedCash != 0) lines.Add(new("BANK", e.CountedCash, 0, "Cash deposited"));
-        if (e.ExpectedCash != 0) lines.Add(new("CASH_ON_HAND", 0, e.ExpectedCash, "Close cash drawer"));
-        if (variance > 0) lines.Add(new("CASH_VARIANCE", 0, variance, "Cash overage"));
-        else if (variance < 0) lines.Add(new("CASH_VARIANCE", -variance, 0, "Cash shortage"));
-        await PostJournal(c, tx, $"cash-close:{e.CashSessionId}", $"Cash session close {e.CashSessionId}", e.CashSessionId, lines, ct);
-    }
-
-    private static async Task PostGoodsReceived(SqlConnection c, SqlTransaction tx, GoodsReceivedEvent e, CancellationToken ct)
-    {
-        if (e.TotalCost == 0) return;
-        await PostJournal(c, tx, $"goods-received:{e.PurchaseOrderId}", $"Goods received for purchase order {e.PurchaseOrderId}",
-            e.PurchaseOrderId,
-            [new("INVENTORY", e.TotalCost, 0, "Inventory received"),
-             new("GOODS_RECEIVED_NOT_INVOICED", 0, e.TotalCost, "Uninvoiced receipt")], ct);
-    }
-
-    private static async Task CreateLowStockAlert(SqlConnection c, SqlTransaction tx, Guid productId, CancellationToken ct)
-    {
-        // Idempotent: one open alert per product. The unique index ux_low_stock_alert_open_product backs this up,
-        // and if two deliveries ever raced, the loser fails once and is skipped by this check on retry.
-        await using var command = new SqlCommand("""
-            IF NOT EXISTS (SELECT 1 FROM procurement.low_stock_alert WHERE product_id=@product AND acknowledged=0)
-                INSERT INTO procurement.low_stock_alert(id,product_id,raised_at,acknowledged)
-                VALUES(@id,@product,@now,0)
-            """, c, tx);
-        command.Parameters.AddWithValue("id", Guid.NewGuid());
-        command.Parameters.AddWithValue("product", productId);
-        command.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-        await command.ExecuteNonQueryAsync(ct);
-    }
-
-    private static async Task PostJournal(SqlConnection c, SqlTransaction tx, string key,
-        string description, Guid? reference, IReadOnlyList<JournalLineInput> lines, CancellationToken ct)
-    {
-        var debits = lines.Sum(line => line.Debit);
-        var credits = lines.Sum(line => line.Credit);
-        if (debits != credits) throw new InvalidOperationException($"Journal entry {key} is unbalanced.");
-        var entryId = Guid.NewGuid();
-        await using (var entry = new SqlCommand("""
-            IF EXISTS (SELECT 1 FROM finance.journal_entry WHERE event_key=@key)
-                SELECT CAST(NULL AS uniqueidentifier);
-            ELSE
-            BEGIN
-                INSERT INTO finance.journal_entry(id,event_key,description,reference_id,posted_at)
-                VALUES(@id,@key,@description,@reference,@now);
-                SELECT @id;
-            END
-            """, c, tx))
-        {
-            entry.Parameters.AddWithValue("id", entryId);
-            entry.Parameters.AddWithValue("key", key);
-            entry.Parameters.AddWithValue("description", description);
-            entry.Parameters.AddWithValue("reference", (object?)reference ?? DBNull.Value);
-            entry.Parameters.AddWithValue("now", DateTimeOffset.UtcNow);
-            var inserted = await entry.ExecuteScalarAsync(ct);
-            if (inserted is null) return;
-            entryId = (Guid)inserted;
-        }
-        foreach (var line in lines)
-        {
-            await using var insertLine = new SqlCommand("""
-                INSERT INTO finance.journal_line(id,journal_entry_id,account_code,debit_amount,credit_amount,description)
-                VALUES(@id,@entry,@account,@debit,@credit,@description)
-                """, c, tx);
-            insertLine.Parameters.AddWithValue("id", Guid.NewGuid());
-            insertLine.Parameters.AddWithValue("entry", entryId);
-            insertLine.Parameters.AddWithValue("account", line.Account);
-            insertLine.Parameters.AddWithValue("debit", line.Debit);
-            insertLine.Parameters.AddWithValue("credit", line.Credit);
-            insertLine.Parameters.AddWithValue("description", line.Description);
-            await insertLine.ExecuteNonQueryAsync(ct);
-        }
-    }
-
-    private sealed record JournalLineInput(string Account, decimal Debit, decimal Credit, string Description);
 }
-

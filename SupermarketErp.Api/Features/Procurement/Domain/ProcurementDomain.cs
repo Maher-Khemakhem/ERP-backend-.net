@@ -152,5 +152,8 @@ public sealed class LowStockAlertEntity
     public DateTimeOffset RaisedAt { get; private set; }
     public bool Acknowledged { get; private set; }
 
+    public static LowStockAlertEntity Raise(Guid productId, DateTimeOffset now) =>
+        new() { Id = Guid.NewGuid(), ProductId = productId, RaisedAt = now, Acknowledged = false };
+
     public void Acknowledge() => Acknowledged = true;
 }

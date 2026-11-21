@@ -197,3 +197,45 @@ public static class CardSettlement
         new(AccountCodes.CardClearing, 0, amount, "Clear card receivable")
     ];
 }
+
+/// <summary>The journal lines the books get for each business event, with the accounting rules in one place.</summary>
+public static class AutomaticPostings
+{
+    /// <summary>A sale: money in (cash or card clearing), revenue and VAT out, and the cost of the goods taken from stock.</summary>
+    public static IReadOnlyList<JournalLineInput> Sale(string paymentMethod, decimal net, decimal vat, decimal gross, decimal costOfGoodsSold)
+    {
+        var lines = new List<JournalLineInput>
+        {
+            new(paymentMethod == "CASH" ? AccountCodes.CashOnHand : AccountCodes.CardClearing, gross, 0, "Customer payment"),
+            new(AccountCodes.SalesRevenue, 0, net, "Retail sale")
+        };
+        if (vat != 0) lines.Add(new(AccountCodes.OutputVat, 0, vat, "Output VAT"));
+        if (costOfGoodsSold != 0)
+        {
+            lines.Add(new(AccountCodes.CostOfGoodsSold, costOfGoodsSold, 0, "Cost of goods sold"));
+            lines.Add(new(AccountCodes.Inventory, 0, costOfGoodsSold, "Inventory consumed"));
+        }
+        return lines;
+    }
+
+    /// <summary>Closing a till: the counted cash goes to the bank, the drawer is emptied, the difference is a variance. Empty when nothing moved.</summary>
+    public static IReadOnlyList<JournalLineInput> CashClose(decimal expectedCash, decimal countedCash)
+    {
+        if (expectedCash == 0 && countedCash == 0) return [];
+        var variance = countedCash - expectedCash;
+        var lines = new List<JournalLineInput>();
+        if (countedCash != 0) lines.Add(new(AccountCodes.Bank, countedCash, 0, "Cash deposited"));
+        if (expectedCash != 0) lines.Add(new(AccountCodes.CashOnHand, 0, expectedCash, "Close cash drawer"));
+        if (variance > 0) lines.Add(new(AccountCodes.CashVariance, 0, variance, "Cash overage"));
+        else if (variance < 0) lines.Add(new(AccountCodes.CashVariance, -variance, 0, "Cash shortage"));
+        return lines;
+    }
+
+    /// <summary>Received goods increase inventory against "goods received not invoiced". Empty for a free delivery.</summary>
+    public static IReadOnlyList<JournalLineInput> GoodsReceived(decimal totalCost) =>
+        totalCost == 0 ? [] :
+        [
+            new(AccountCodes.Inventory, totalCost, 0, "Inventory received"),
+            new(AccountCodes.GoodsReceivedNotInvoiced, 0, totalCost, "Uninvoiced receipt")
+        ];
+}

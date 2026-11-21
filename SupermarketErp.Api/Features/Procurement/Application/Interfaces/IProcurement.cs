@@ -40,4 +40,6 @@ public interface IProcurementRepository
 
     Task<IReadOnlyList<LowStockAlertEntity>> ListAlerts(CancellationToken ct);
     Task<LowStockAlertEntity?> FindAlert(Guid id, CancellationToken ct);
+    Task<bool> HasOpenAlert(Guid productId, CancellationToken ct);
+    void Add(LowStockAlertEntity alert);
 }

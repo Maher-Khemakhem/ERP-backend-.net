@@ -8,7 +8,7 @@ namespace SupermarketErp.Api.Features.Finance;
 /// and card settlement. It orchestrates; the entities enforce the accounting rules (balanced postings, invoice
 /// VAT, payment limits). Postings are idempotent: the same event key is only booked once.
 /// </summary>
-public sealed class FinanceService(IFinanceRepository repository, IUnitOfWork unitOfWork) : IFinanceService
+public sealed class FinanceService(IFinanceRepository repository, IUnitOfWork unitOfWork, JournalPoster poster) : IFinanceService
 {
     // ---- the books -------------------------------------------------------------------------
 
@@ -109,12 +109,8 @@ public sealed class FinanceService(IFinanceRepository repository, IUnitOfWork un
     // ---- helpers ---------------------------------------------------------------------------
 
     /// <summary>Books a journal entry unless one with the same event key already exists.</summary>
-    private async Task Post(string eventKey, string description, Guid? reference, IReadOnlyList<JournalLineInput> lines, CancellationToken ct)
-    {
-        var entry = JournalEntryEntity.Post(eventKey, description, reference, lines, DateTimeOffset.UtcNow);
-        if (await repository.JournalExists(eventKey, ct)) return;
-        repository.Add(entry);
-    }
+    private Task Post(string eventKey, string description, Guid? reference, IReadOnlyList<JournalLineInput> lines, CancellationToken ct) =>
+        poster.PostOnce(eventKey, description, reference, lines, ct);
 
     private static InvoiceView Invoice(SupplierInvoiceEntity x) => new(
         x.Id, x.SupplierId, x.PurchaseOrderId, x.InvoiceNumber, Money(x.Subtotal), Money(x.TaxAmount), Money(x.TotalAmount),

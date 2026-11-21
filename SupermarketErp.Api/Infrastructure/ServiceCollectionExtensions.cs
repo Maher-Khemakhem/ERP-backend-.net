@@ -48,6 +48,12 @@ public static class ServiceCollectionExtensions
         services.AddScoped<IProcurementService, ProcurementService>();
         services.AddScoped<IFinanceRepository, FinanceRepository>();
         services.AddScoped<IFinanceService, FinanceService>();
+        services.AddScoped<JournalPoster>();
+        services.AddScoped<IOutboxHandler, SaleCompletedHandler>();
+        services.AddScoped<IOutboxHandler, OnlineSaleConfirmedHandler>();
+        services.AddScoped<IOutboxHandler, CashSessionClosedHandler>();
+        services.AddScoped<IOutboxHandler, GoodsReceivedHandler>();
+        services.AddScoped<IOutboxHandler, LowStockAlertHandler>();
         services.AddScoped<IUnitOfWork, UnitOfWork>();
         services.AddScoped<IEventOutbox, EventOutbox>();
         services.AddScoped<IPosRepository, PosRepository>();
@@ -66,8 +72,13 @@ public static class ServiceCollectionExtensions
         AddAuthentication(services, configuration);
         AddAuthorization(services);
         services.AddSingleton<LoginRateLimiter>();
+        // Development accepts any local or private-network origin so the Vite dev server just works. Everywhere else a
+        // browser origin is only trusted when it is listed in CORS_ALLOWED_ORIGINS (comma separated, e.g. https://erp.example.com).
+        var allowedOrigins = (configuration["CORS_ALLOWED_ORIGINS"] ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(origin => origin.TrimEnd('/')).ToHashSet(StringComparer.OrdinalIgnoreCase);
         services.AddCors(options => options.AddPolicy("java-compatible", policy => policy
-            .SetIsOriginAllowed(IsAllowedDevelopmentOrigin)
+            .SetIsOriginAllowed(origin => environment.IsDevelopment() ? IsAllowedDevelopmentOrigin(origin) : allowedOrigins.Contains(origin.TrimEnd('/')))
             .AllowAnyHeader()
             .AllowAnyMethod()
             .AllowCredentials()));

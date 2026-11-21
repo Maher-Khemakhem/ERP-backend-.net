@@ -32,6 +32,11 @@ public sealed class ProcurementRepository(BusinessDbContext db) : IProcurementRe
     public async Task<IReadOnlyList<LowStockAlertEntity>> ListAlerts(CancellationToken ct) =>
         await db.LowStockAlerts.AsNoTracking().OrderByDescending(x => x.RaisedAt).ToListAsync(ct);
 
+    public Task<bool> HasOpenAlert(Guid productId, CancellationToken ct) =>
+        db.LowStockAlerts.AnyAsync(x => x.ProductId == productId && !x.Acknowledged, ct);
+
+    public void Add(LowStockAlertEntity alert) => db.LowStockAlerts.Add(alert);
+
     public Task<LowStockAlertEntity?> FindAlert(Guid id, CancellationToken ct) =>
         db.LowStockAlerts.SingleOrDefaultAsync(x => x.Id == id, ct);
 }

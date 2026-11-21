@@ -174,6 +174,8 @@ public sealed class BusinessDbContext(DbContextOptions<BusinessDbContext> option
         sp.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever(); sp.Property(x => x.PaymentReference).HasColumnName("payment_reference"); sp.Property(x => x.InvoiceId).HasColumnName("invoice_id"); sp.Property(x => x.Amount).HasColumnName("amount").HasPrecision(38, 2); sp.Property(x => x.PaymentMethod).HasColumnName("payment_method"); sp.Property(x => x.PaidDate).HasColumnName("paid_date");
         var ob = b.Entity<DotnetOutboxEntity>(); ob.ToTable("dotnet_outbox", "platform").HasKey(x => x.Id);
         ob.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever(); ob.Property(x => x.EventType).HasColumnName("event_type"); ob.Property(x => x.Payload).HasColumnName("payload"); ob.Property(x => x.OccurredAt).HasColumnName("occurred_at");
+        ob.Property(x => x.ProcessedAt).HasColumnName("processed_at"); ob.Property(x => x.Attempts).HasColumnName("attempts"); ob.Property(x => x.LastError).HasColumnName("last_error");
+        ob.Property(x => x.FailedAt).HasColumnName("failed_at"); ob.Property(x => x.NextAttemptAt).HasColumnName("next_attempt_at");
     }
 }
 
@@ -200,6 +202,17 @@ public sealed class LotEntryEntity
     public short? ReservedUnitType { get; set; }
 }
 public sealed class LotEntity { public Guid Id { get; set; } public string LotNumber { get; set; } = ""; public Guid ProductId { get; set; } public DateOnly? ExpiryDate { get; set; } public DateOnly ReceivedDate { get; set; } public string? SupplierReference { get; set; } public decimal UnitCost { get; set; } }
-public sealed class DotnetOutboxEntity { public Guid Id { get; set; } public string EventType { get; set; } = ""; public string Payload { get; set; } = ""; public DateTimeOffset OccurredAt { get; set; } }
+public sealed class DotnetOutboxEntity
+{
+    public Guid Id { get; set; }
+    public string EventType { get; set; } = "";
+    public string Payload { get; set; } = "";
+    public DateTimeOffset OccurredAt { get; set; }
+    public DateTimeOffset? ProcessedAt { get; set; }
+    public int Attempts { get; set; }
+    public string? LastError { get; set; }
+    public DateTimeOffset? FailedAt { get; set; }
+    public DateTimeOffset? NextAttemptAt { get; set; }
+}
 public sealed class StripeCheckoutEntity { public Guid Id { get; set; } public Guid OrderId { get; set; } public string? SessionId { get; set; } public string? Url { get; set; } public decimal TndAmount { get; set; } public long AmountCents { get; set; } public decimal Rate { get; set; } public string Status { get; set; } = ""; public long Version { get; set; } public DateTimeOffset CreatedAt { get; set; } }
 public sealed class AppUserEntity { public Guid Id { get; set; } public string Username { get; set; } = ""; public string DisplayName { get; set; } = ""; }
