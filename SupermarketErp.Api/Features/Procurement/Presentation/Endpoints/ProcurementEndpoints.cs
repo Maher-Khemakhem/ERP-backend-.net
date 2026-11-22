@@ -24,10 +24,10 @@ public static class ProcurementEndpoints
 
         var orders = endpoints.MapGroup("/api/procurement/orders").WithTags("Purchase orders");
         orders.MapGet("", async (IProcurementService service, CancellationToken ct) => Results.Ok(await service.ListOrders(ct)))
-            .RequireAuthorization(Policies.InventoryWrite);
+            .RequireAuthorization(Policies.OrdersRead);
         orders.MapGet("/{id:guid}", async (Guid id, IProcurementService service, CancellationToken ct) =>
             await service.GetOrder(id, ct) is { } item ? Results.Ok(item) : Results.NotFound())
-            .RequireAuthorization(Policies.InventoryWrite);
+            .RequireAuthorization(Policies.OrdersRead);
         orders.MapPost("", async (CreateOrderRequest request, IProcurementService service, CancellationToken ct) =>
             Results.Ok(new { id = await service.CreateOrder(request, ct) }))
             .RequireAuthorization(Policies.InventoryWrite);

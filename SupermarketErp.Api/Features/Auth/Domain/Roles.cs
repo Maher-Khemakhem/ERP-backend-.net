@@ -20,4 +20,6 @@ public static class Policies
     public const string Admin = "Admin";
     public const string StaffRead = "StaffRead";
     public const string InventoryWrite = "InventoryWrite";
+    /// <summary>Read-only view of purchase orders: the inventory roles plus accountants, who match invoices to receipts.</summary>
+    public const string OrdersRead = "OrdersRead";
 }

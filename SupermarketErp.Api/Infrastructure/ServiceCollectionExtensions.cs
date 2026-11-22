@@ -130,6 +130,8 @@ public static class ServiceCollectionExtensions
                 Roles.Admin, Roles.Manager, Roles.Cashier, Roles.InventoryManager, Roles.Accountant));
             options.AddPolicy(Policies.InventoryWrite, policy => policy.RequireRole(
                 Roles.Admin, Roles.Manager, Roles.InventoryManager));
+            options.AddPolicy(Policies.OrdersRead, policy => policy.RequireRole(
+                Roles.Admin, Roles.Manager, Roles.InventoryManager, Roles.Accountant));
             options.AddPolicy(Policies.Admin, policy => policy.RequireRole(Roles.Admin));
         });
     }

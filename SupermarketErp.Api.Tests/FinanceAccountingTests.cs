@@ -205,6 +205,14 @@ public sealed class FinanceAccountingTests(ApiFixture fixture) : IClassFixture<A
         Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync("/api/finance/journals")).StatusCode);
     }
 
+    [Fact]
+    public async Task Accountants_can_read_purchase_orders_but_cashiers_cannot()
+    {
+        Assert.Equal(HttpStatusCode.OK, (await Send("ACCOUNTANT", "/api/procurement/orders")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await Send("INVENTORY_MANAGER", "/api/procurement/orders")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await Send("CASHIER", "/api/procurement/orders")).StatusCode);
+    }
+
     // ---- helpers ---------------------------------------------------------------------------
 
     private async Task<(HttpStatusCode Status, JsonElement Body)> TryInvoice(Guid supplier, string number, decimal subtotal, decimal vat,
