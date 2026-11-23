@@ -1,5 +1,10 @@
 # Supermarket ERP API
 
+**Frontends**
+
+- ERP back office: https://github.com/Maher-Khemakhem/ERP_frontend
+- Customer storefront: https://github.com/Maher-Khemakhem/storefront
+
 The Supermarket ERP API is the backend for a supermarket operations platform. It provides the shared services used by the staff ERP application and the customer storefront, keeping products, stock, sales, purchasing, finance, and online orders in one system.
 
 ## What the API does
